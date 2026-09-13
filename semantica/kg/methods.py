@@ -966,6 +966,7 @@ def summarize_community(
     llm: Optional[Any] = None,
     method: str = "default",
     max_tokens: int = 4000,
+    text_chunks: Optional[List[Any]] = None,
     **kwargs: Any,
 ) -> CommunityReport:
     """
@@ -977,6 +978,7 @@ def summarize_community(
         llm: LLM provider instance, structured client, or callable
         method: Community summary method ("default", "summarizer", "llm")
         max_tokens: Maximum context token budget
+        text_chunks: Optional source text chunks or evidence
         **kwargs: Extra options passed to CommunitySummarizer
 
     Returns:
@@ -994,6 +996,7 @@ def summarize_community(
             llm=llm,
             fallback_on_custom_error=fallback,
             max_tokens=max_tokens,
+            text_chunks=text_chunks,
             **kwargs,
         )
         if result is not CUSTOM_METHOD_FELL_BACK:
@@ -1004,7 +1007,11 @@ def summarize_community(
             llm=llm, max_tokens=max_tokens, **kwargs
         )
         return summarizer.summarize_community(
-            community, graph=graph, max_tokens=max_tokens, **kwargs
+            community,
+            graph=graph,
+            max_tokens=max_tokens,
+            text_chunks=text_chunks,
+            **kwargs,
         )
     except Exception as e:
         logger.error(f"Failed to summarize community: {e}")
@@ -1018,6 +1025,7 @@ def summarize_hierarchy(
     method: str = "default",
     max_tokens: int = 4000,
     levels: Optional[List[int]] = None,
+    text_chunks: Optional[List[Any]] = None,
     **kwargs: Any,
 ) -> Dict[str, CommunityReport]:
     """
@@ -1030,6 +1038,7 @@ def summarize_hierarchy(
         method: Community summary method ("default", "summarizer", "llm")
         max_tokens: Maximum context token budget
         levels: Optional subset of hierarchy levels to summarize
+        text_chunks: Optional source text chunks or evidence
         **kwargs: Extra options passed to CommunitySummarizer
 
     Returns:
@@ -1051,6 +1060,7 @@ def summarize_hierarchy(
             fallback_on_custom_error=fallback,
             max_tokens=max_tokens,
             levels=levels,
+            text_chunks=text_chunks,
             **kwargs,
         )
         if result is not CUSTOM_METHOD_FELL_BACK:
@@ -1065,6 +1075,7 @@ def summarize_hierarchy(
             graph=graph,
             levels=levels,
             max_tokens=max_tokens,
+            text_chunks=text_chunks,
             **kwargs,
         )
     except Exception as e:

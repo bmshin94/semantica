@@ -1162,3 +1162,729 @@ class TestEdgeCasesAndBugFixes:
             )
             == 0
         )
+
+
+# ---------------------------------------------------------------------------
+# Test Qodo Review Fixes (PR #1605 / Issue #1548)
+# ---------------------------------------------------------------------------
+
+
+class TestQodoReviewFixes:
+    """Unit and regression tests for 8 Qodo review issues."""
+
+    def test_substantive_attributes_and_source_evidence_packing(self):
+        """Issue 1: Substantive entity/rel attributes & text chunks."""
+        comm = HierarchicalCommunity(
+            id="c_evidence",
+            level=0,
+            index=0,
+            entity_ids=["ent_1", "ent_2"],
+        )
+        graph = {
+            "entities": [
+                {
+                    "id": "ent_1",
+                    "name": "Alpha Node",
+                    "type": "Organization",
+                    "description": "Primary research institute",
+                    "provenance": "doc_alpha.pdf",
+                },
+                {
+                    "id": "ent_2",
+                    "name": "Beta Node",
+                    "type": "Person",
+                    "description": "Lead investigator",
+                },
+            ],
+            "relationships": [
+                {
+                    "source": "ent_1",
+                    "target": "ent_2",
+                    "type": "employs",
+                    "weight": 3.0,
+                    "description": "Long-term employment relationship",
+                    "evidence": "Contract signed 2020",
+                }
+            ],
+        }
+        text_chunks = [
+            {
+                "text": "Alpha Node was founded in 2010 to study AI.",
+                "source": "history.txt",
+            },
+            "Supplementary raw excerpt detailing research outputs.",
+        ]
+
+        summarizer = CommunitySummarizer()
+        context = summarizer._pack_context(
+            comm,
+            budget=2000,
+            graph=graph,
+            text_chunks=text_chunks,
+        )
+
+        # Entity substantive attributes
+        assert "Alpha Node" in context
+        assert "Organization" in context
+        assert "Primary research institute" in context
+        assert "doc_alpha.pdf" in context
+
+        # Relationship attributes
+        assert "employs" in context
+        assert "Long-term employment relationship" in context
+        assert "Contract signed 2020" in context
+
+        # Source evidence text chunks
+        assert "## Source Evidence / Text Excerpts" in context
+        assert "Alpha Node was founded in 2010" in context
+        assert "history.txt" in context
+        assert "Supplementary raw excerpt" in context
+
+    def test_strict_token_budget_tiny_limit(self):
+        """Issue 2 & 8: Strict token limit bounding and no tiny floors."""
+        # Check constructor does not clamp tiny limits to 100/200
+        summarizer = CommunitySummarizer(max_tokens=35)
+        assert summarizer.max_tokens == 35
+
+        comm = HierarchicalCommunity(
+            id="c_tiny",
+            level=0,
+            index=0,
+            entity_ids=["e1", "e2", "e3", "e4", "e5"],
+        )
+        graph = nx.complete_graph(["e1", "e2", "e3", "e4", "e5"])
+
+        captured_prompts = []
+
+        def mock_llm(prompt, **kwargs):
+            captured_prompts.append(prompt)
+            return json.dumps({
+                "title": "Tiny Comm",
+                "summary": "Short",
+                "impact_rating": 5.0,
+            })
+
+        rep = summarizer.summarize_community(
+            comm,
+            graph=graph,
+            max_tokens=35,
+            llm=mock_llm,
+        )
+        assert rep is not None
+        assert len(captured_prompts) == 1
+        prompt = captured_prompts[0]
+        # Total prompt must strictly be within max_tokens
+        token_count = estimate_tokens(prompt)
+        assert token_count <= 35
+
+    def test_strict_token_budget_with_large_scaffolding(self):
+        """Issue 2: Large custom system prompt strictly bounded."""
+        custom_prompt = "You are an expert analyst. " * 15  # ~60 tokens
+        summarizer = CommunitySummarizer(
+            system_prompt=custom_prompt,
+            max_tokens=120,
+        )
+        comm = HierarchicalCommunity(
+            id="c_scaffold",
+            level=0,
+            index=0,
+            entity_ids=["n1", "n2", "n3"],
+        )
+        graph = nx.path_graph(["n1", "n2", "n3"])
+
+        captured_prompts = []
+
+        def mock_llm(prompt, **kwargs):
+            captured_prompts.append(prompt)
+            return json.dumps({
+                "title": "Scaffold Comm",
+                "summary": "Summary",
+                "impact_rating": 6.0,
+            })
+
+        summarizer.summarize_community(
+            comm,
+            graph=graph,
+            max_tokens=120,
+            llm=mock_llm,
+        )
+        assert len(captured_prompts) == 1
+        assert estimate_tokens(captured_prompts[0]) <= 120
+
+    def test_dict_graph_nodes_and_edges_with_aliases(self):
+        """Issue 3: Dict graph nodes/edges, dict values, and aliases."""
+        comm = HierarchicalCommunity(
+            id="c_dict",
+            level=0,
+            index=0,
+            entity_ids=["N1", "N2"],
+        )
+        dict_graph = {
+            "nodes": {
+                "N1": {"name": "Node One", "role": "server"},
+                "N2": {"name": "Node Two", "role": "client"},
+                "N3": {"name": "Node Three", "role": "external"},
+            },
+            "edges": [
+                {
+                    "from": "N1",
+                    "to": "N2",
+                    "type": "connects_to",
+                    "weight": 4.5,
+                    "description": "Internal link",
+                },
+                {
+                    "source_id": "N1",
+                    "target_id": "N3",
+                    "type": "uplink",
+                    "weight": 1.0,
+                },
+            ],
+        }
+
+        summarizer = CommunitySummarizer()
+        subgraph = summarizer._extract_subgraph(comm, dict_graph)
+
+        # Internal node attributes preserved
+        assert "N1" in subgraph["nodes"]
+        assert "N2" in subgraph["nodes"]
+        assert "N3" not in subgraph["nodes"]
+        assert subgraph["nodes"]["N1"]["name"] == "Node One"
+
+        # Internal edges preserved
+        assert len(subgraph["edges"]) == 1
+        assert subgraph["edges"][0]["from"] == "N1"
+        assert subgraph["edges"][0]["to"] == "N2"
+        assert subgraph["edges"][0]["description"] == "Internal link"
+
+        # Key relationships / bridge edges from subgraph
+        edges = summarizer._identify_bridge_edges(
+            comm, subgraph=subgraph
+        )
+        assert len(edges) == 1
+        assert edges[0]["source"] == "N1"
+        assert edges[0]["target"] == "N2"
+        assert edges[0].get("type") == "connects_to"
+        assert edges[0].get("description") == "Internal link"
+
+        # Bridge edges identified when child reports present
+        cr1 = CommunityReport(
+            community_id="c_sub1",
+            level=0,
+            title="Sub1",
+            summary="S1",
+            member_entities=["N1"],
+        )
+        cr2 = CommunityReport(
+            community_id="c_sub2",
+            level=0,
+            title="Sub2",
+            summary="S2",
+            member_entities=["N2"],
+        )
+        bridges = summarizer._identify_bridge_edges(
+            comm, child_reports=[cr1, cr2], subgraph=subgraph
+        )
+        assert len(bridges) == 1
+        assert bridges[0]["source"] == "N1"
+        assert bridges[0]["target"] == "N2"
+
+    def test_pagerank_centrality_metric_invoked(self):
+        """Issue 4: PageRank uses calculate_pagerank; invalid raises error."""
+        comm = HierarchicalCommunity(
+            id="c_pagerank",
+            level=0,
+            index=0,
+            entity_ids=["A", "B", "C"],
+        )
+        g = nx.DiGraph()
+        g.add_edges_from([("A", "B"), ("B", "C"), ("C", "A")])
+
+        summarizer = CommunitySummarizer(centrality_metric="pagerank")
+        scores = summarizer._compute_centrality(g, comm.entity_ids)
+        assert len(scores) == 3
+        assert all(isinstance(v, float) for v in scores.values())
+
+        # Also works seamlessly on dict graphs via calculator._to_networkx
+        dict_g = {
+            "nodes": ["A", "B", "C"],
+            "edges": [
+                {"source": "A", "target": "B"},
+                {"source": "B", "target": "C"},
+                {"source": "C", "target": "A"},
+            ],
+        }
+        dict_scores = summarizer._compute_centrality(dict_g, comm.entity_ids)
+        assert len(dict_scores) == 3
+
+        # Invalid metric rejected with ValueError
+        with pytest.raises(ValueError, match="Unsupported centrality metric"):
+            CommunitySummarizer(centrality_metric="nonexistent_metric")
+
+    def test_cache_key_varies_with_all_inputs(self):
+        """Issue 5: Cache key includes graph, chunks, tokens, settings."""
+        comm = HierarchicalCommunity(
+            id="c_cache",
+            level=0,
+            index=0,
+            entity_ids=["X", "Y"],
+        )
+        summarizer = CommunitySummarizer()
+
+        base_key = summarizer._compute_cache_key(comm)
+        # Baseline returns content_hash for disk compatibility
+        assert base_key == comm.content_hash
+
+        # Varied graph produces different key
+        g1 = nx.Graph([("X", "Y")])
+        key_g1 = summarizer._compute_cache_key(comm, graph=g1)
+        assert key_g1 != base_key
+
+        # Varied text chunks produces different key
+        chunks = ["Evidence 1"]
+        key_chunks = summarizer._compute_cache_key(comm, text_chunks=chunks)
+        assert key_chunks != base_key
+
+        # Varied max_tokens produces different key
+        key_tokens = summarizer._compute_cache_key(comm, max_tokens=500)
+        assert key_tokens != base_key
+
+        # Varied prompt produces different key
+        key_prompt = summarizer._compute_cache_key(
+            comm, prompt="Custom prompt text"
+        )
+        assert key_prompt != base_key
+
+        # Varied rank produces different key
+        key_rank = summarizer._compute_cache_key(comm, rank=7.5)
+        assert key_rank != base_key
+
+        # End-to-end caching test: report with text_chunks is not returned
+        # when text_chunks change
+        call_count = 0
+
+        def counting_llm(prompt, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return json.dumps({
+                "title": f"Report Call {call_count}",
+                "summary": "Summary",
+                "impact_rating": 5.0,
+            })
+
+        rep1 = summarizer.summarize_community(
+            comm, text_chunks=["Chunk A"], llm=counting_llm
+        )
+        assert call_count == 1
+        assert rep1.title == "Report Call 1"
+
+        # Calling again with identical inputs hits memory cache
+        rep1_cached = summarizer.summarize_community(
+            comm, text_chunks=["Chunk A"], llm=counting_llm
+        )
+        assert call_count == 1
+        assert rep1_cached.title == "Report Call 1"
+
+        # Calling with different chunks bypasses cache and generates report
+        rep2 = summarizer.summarize_community(
+            comm, text_chunks=["Chunk B"], llm=counting_llm
+        )
+        assert call_count == 2
+        assert rep2.title == "Report Call 2"
+
+    def test_summarize_hierarchy_level_filtering_skips_unneeded_levels(self):
+        """Issue 6: Level filter only computes target levels & descendants."""
+        c_l0_a = HierarchicalCommunity(
+            id="c_0a", level=0, index=0, entity_ids=["e1"]
+        )
+        c_l0_b = HierarchicalCommunity(
+            id="c_0b", level=0, index=1, entity_ids=["e2"]
+        )
+        c_l1 = HierarchicalCommunity(
+            id="c_1",
+            level=1,
+            index=0,
+            entity_ids=["e1", "e2"],
+            child_ids=["c_0a", "c_0b"],
+        )
+        c_l2 = HierarchicalCommunity(
+            id="c_2",
+            level=2,
+            index=0,
+            entity_ids=["e1", "e2"],
+            child_ids=["c_1"],
+        )
+
+        hierarchy = CommunityHierarchy(
+            communities=[c_l0_a, c_l0_b, c_l1, c_l2]
+        )
+
+        def recording_llm(prompt, **kwargs):
+            return json.dumps({
+                "title": "Community Report",
+                "summary": "Summary",
+                "impact_rating": 5.0,
+            })
+
+        summarizer = CommunitySummarizer()
+
+        # Target level 0 only: level 1 and 2 must NOT be processed
+        reports_l0 = summarizer.summarize_hierarchy(
+            hierarchy,
+            levels=[0],
+            llm=recording_llm,
+        )
+        assert set(reports_l0.keys()) == {"c_0a", "c_0b"}
+
+        # Target level 1 only: level 0 is needed as dependency, but level 2
+        # is skipped
+        reports_l1 = summarizer.summarize_hierarchy(
+            hierarchy,
+            levels=[1],
+            llm=recording_llm,
+        )
+        assert "c_1" in reports_l1
+        # Returned dictionary only contains requested target level [1]
+        assert set(reports_l1.keys()) == {"c_1"}
+        # And level 2 was never processed (not in hierarchy result)
+        assert "c_2" not in reports_l1
+
+    def test_tier1_failure_skips_tier2_provider_retry(self):
+        """Issue 7: Wrapper generate_typed failure skips Tier 2 retry."""
+        comm = HierarchicalCommunity(
+            id="c_tier",
+            level=0,
+            index=0,
+            entity_ids=["t1", "t2"],
+        )
+        summarizer = CommunitySummarizer()
+
+        mock_provider = MagicMock()
+        mock_provider.generate_typed = MagicMock(
+            return_value={
+                "title": "Provider Tier 2",
+                "summary": "P",
+                "impact_rating": 5.0,
+            }
+        )
+
+        mock_llm = MagicMock()
+        mock_llm.provider = mock_provider
+        # Tier 1 fails
+        mock_llm.generate_typed = MagicMock(
+            side_effect=RuntimeError("Tier 1 API timeout")
+        )
+        # Tier 3 succeeds as fallback
+        mock_llm.generate_structured = MagicMock(
+            return_value={
+                "title": "Structured Tier 3",
+                "summary": "S",
+                "impact_rating": 6.0,
+            }
+        )
+
+        summarizer.llm = mock_llm
+        schema = summarizer._call_llm(comm, "Prompt")
+
+        # Tier 1 was attempted
+        assert mock_llm.generate_typed.called
+        # Tier 2 provider.generate_typed must have been SKIPPED
+        assert not mock_provider.generate_typed.called
+        # Tier 3 was executed
+        assert mock_llm.generate_structured.called
+        assert schema.title == "Structured Tier 3"
+
+        # Case B: LLM has provider.generate_typed but NO generate_typed
+        mock_raw_wrapper = MagicMock(spec=["provider"])
+        mock_raw_wrapper.provider = MagicMock()
+        mock_raw_wrapper.provider.generate_typed = MagicMock(
+            return_value={
+                "title": "Direct Provider",
+                "summary": "DP",
+                "impact_rating": 7.0,
+            }
+        )
+        summarizer.llm = mock_raw_wrapper
+        schema2 = summarizer._call_llm(comm, "Prompt")
+        assert mock_raw_wrapper.provider.generate_typed.called
+        assert schema2.title == "Direct Provider"
+
+    def test_methods_api_forwards_text_chunks(self):
+        """Top-level summarize methods forward text_chunks."""
+        comm = HierarchicalCommunity(
+            id="c_top", level=0, index=0, entity_ids=["e1"]
+        )
+        rep = summarize_community(
+            comm,
+            text_chunks=["Top-level source evidence chunk"],
+        )
+        assert rep is not None
+        assert rep.community_id == "c_top"
+
+        hierarchy = CommunityHierarchy(communities=[comm])
+        reports = summarize_hierarchy(
+            hierarchy,
+            text_chunks=["Top-level hierarchy source chunk"],
+        )
+        assert "c_top" in reports
+
+    def test_zero_negative_and_tiny_token_limits_fallback(self):
+        """Issue 2 & 8: Zero/negative token limits return fallback."""
+        comm = HierarchicalCommunity(
+            id="c_tiny",
+            level=0,
+            index=0,
+            entity_ids=["T1", "T2"],
+        )
+        mock_llm = MagicMock()
+
+        # max_tokens = 0
+        s_zero = CommunitySummarizer(llm=mock_llm, max_tokens=0)
+        rep_zero = s_zero.summarize_community(comm)
+        assert rep_zero is not None
+        assert rep_zero.community_id == "c_tiny"
+        assert not mock_llm.called
+
+        # max_tokens = -5
+        s_neg = CommunitySummarizer(llm=mock_llm, max_tokens=-5)
+        rep_neg = s_neg.summarize_community(comm)
+        assert rep_neg is not None
+        assert rep_neg.community_id == "c_tiny"
+        assert not mock_llm.called
+
+        # Non-positive override max_tokens = 0
+        s_tiny = CommunitySummarizer(llm=mock_llm)
+        rep_tiny = s_tiny.summarize_community(comm, max_tokens=0)
+        assert rep_tiny is not None
+        assert rep_tiny.community_id == "c_tiny"
+        assert not mock_llm.called
+
+    def test_context_first_prompt_truncation_preserves_instructions(self):
+        """Issue 2: Over-budget prompt trims context before template."""
+        comm = HierarchicalCommunity(
+            id="c_trunc",
+            level=0,
+            index=0,
+            entity_ids=[f"E_{i}" for i in range(50)],
+        )
+
+        recorded_prompts = []
+
+        def recording_llm(prompt, **kwargs):
+            recorded_prompts.append(prompt)
+            return json.dumps({
+                "title": "Truncated Report",
+                "summary": "Summary",
+                "impact_rating": 6.0,
+            })
+
+        # Budget of 110 tokens: context is trimmed, but instructions remain
+        summarizer = CommunitySummarizer(llm=recording_llm, max_tokens=110)
+        rep = summarizer.summarize_community(comm)
+        assert rep.title == "Truncated Report"
+        assert len(recorded_prompts) == 1
+        prompt = recorded_prompts[0]
+        assert "Return ONLY the structured JSON report." in prompt
+        assert estimate_tokens(prompt) <= 110
+
+    def test_cache_key_preserves_content_hash_when_community_has_edges(self):
+        """Issue 5: Internal comm.edges preserves comm.content_hash."""
+        comm = HierarchicalCommunity(
+            id="c_edges",
+            level=0,
+            index=0,
+            entity_ids=["X1", "X2"],
+            edges=[{"source": "X1", "target": "X2", "weight": 2.0}],
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            summarizer = CommunitySummarizer(
+                cache_dir=tmpdir, cache_enabled=True
+            )
+            rep = summarizer.summarize_community(comm)
+            h = comm.content_hash
+
+            # Cache file on disk is named exactly by content_hash
+            cache_file = Path(tmpdir) / f"{h}.json"
+            assert cache_file.exists()
+
+            # Retrieval by content_hash succeeds
+            cached = summarizer.get_cached_report(h)
+            assert cached is not None
+            assert cached.title == rep.title
+
+    def test_entity_objects_and_name_resolution_in_pack_context(self):
+        """Issue 1: Subgraph with entity objects and name resolution."""
+        class EntityNode:
+            def __init__(self, eid, name, desc, prov):
+                self.id = eid
+                self.name = name
+                self.description = desc
+                self.provenance = prov
+                self.type = "Scientist"
+
+        comm = HierarchicalCommunity(
+            id="c_obj",
+            level=0,
+            index=0,
+            entity_ids=["Marie Curie"],  # Name as identifier
+        )
+        graph = {
+            "entities": [
+                EntityNode(
+                    "P001",
+                    "Marie Curie",
+                    "Pioneering radiation physicist",
+                    "nobel_prize.pdf",
+                )
+            ],
+            "relationships": [
+                {
+                    "from": "Marie Curie",
+                    "to": "Sorbonne",
+                    "type": "AFFILIATED_WITH",
+                }
+            ],
+        }
+
+        summarizer = CommunitySummarizer()
+        context = summarizer._pack_context(
+            comm,
+            subgraph=graph,
+            budget=2000,
+        )
+
+        assert "Marie Curie" in context
+        assert "Scientist" in context
+        assert "Pioneering radiation physicist" in context
+        assert "nobel_prize.pdf" in context
+
+    def test_bridge_edges_prioritized_over_internal_edges(self):
+        """Issue 1 & 3: Bridge edges across communities prioritized."""
+        c_parent = HierarchicalCommunity(
+            id="c_par",
+            level=1,
+            index=0,
+            entity_ids=["A1", "A2", "B1", "B2"],
+            child_ids=["c_ch1", "c_ch2"],
+        )
+
+        cr1 = CommunityReport(
+            community_id="c_ch1",
+            level=0,
+            title="Child 1",
+            summary="Sub 1",
+            findings=[],
+            impact_rating=5.0,
+            rating_explanation="",
+            member_entities=["A1", "A2"],
+            content_hash="h1",
+        )
+        cr2 = CommunityReport(
+            community_id="c_ch2",
+            level=0,
+            title="Child 2",
+            summary="Sub 2",
+            findings=[],
+            impact_rating=5.0,
+            rating_explanation="",
+            member_entities=["B1", "B2"],
+            content_hash="h2",
+        )
+
+        # Internal edge (A1 -> A2) and Bridge edge (A1 -> B1)
+        subgraph = {
+            "edges": [
+                {"from": "A1", "to": "A2", "type": "INTERNAL_LINK"},
+                {"from": "A1", "to": "B1", "type": "BRIDGE_LINK"},
+            ]
+        }
+
+        summarizer = CommunitySummarizer()
+        bridge_edges = summarizer._identify_bridge_edges(
+            c_parent, child_reports=[cr1, cr2], subgraph=subgraph
+        )
+        assert len(bridge_edges) == 2
+        # Bridge link must be prioritized first
+        assert bridge_edges[0]["type"] == "BRIDGE_LINK"
+        assert bridge_edges[0].get("_is_bridge") is True
+
+        # Pack context with small edge budget: BRIDGE_LINK should be included
+        context = summarizer._pack_context(
+            c_parent,
+            subgraph=subgraph,
+            child_reports=[cr1, cr2],
+            budget=200,
+        )
+        assert "BRIDGE_LINK" in context
+
+    def test_summarize_hierarchy_bfs_skips_unrelated_communities(self):
+        """Issue 6: Multi-branch hierarchy only computes target branch."""
+        # Branch A:
+        c0_a1 = HierarchicalCommunity(
+            id="a1", level=0, index=0, entity_ids=["x1"]
+        )
+        c0_a2 = HierarchicalCommunity(
+            id="a2", level=0, index=1, entity_ids=["x2"]
+        )
+        c1_a = HierarchicalCommunity(
+            id="c1_a",
+            level=1,
+            index=0,
+            entity_ids=["x1", "x2"],
+            child_ids=["a1", "a2"],
+        )
+        c2_top = HierarchicalCommunity(
+            id="top",
+            level=2,
+            index=0,
+            entity_ids=["x1", "x2"],
+            child_ids=["c1_a"],
+        )
+
+        # Branch B (unrelated to c2_top):
+        c0_b1 = HierarchicalCommunity(
+            id="b1", level=0, index=2, entity_ids=["y1"]
+        )
+        c1_b = HierarchicalCommunity(
+            id="c1_b",
+            level=1,
+            index=1,
+            entity_ids=["y1"],
+            child_ids=["b1"],
+        )
+
+        hierarchy = CommunityHierarchy(
+            communities=[c0_a1, c0_a2, c1_a, c2_top, c0_b1, c1_b]
+        )
+
+        processed_ids = []
+
+        def recording_llm(prompt, **kwargs):
+            return json.dumps({
+                "title": "Report",
+                "summary": "Summary",
+                "impact_rating": 5.0,
+            })
+
+        summarizer = CommunitySummarizer()
+        # Mock summarize_community to record which communities are processed
+        orig_summarize = summarizer.summarize_community
+
+        def tracking_summarize(community, **kwargs):
+            processed_ids.append(str(community.id))
+            return orig_summarize(community, llm=recording_llm, **kwargs)
+
+        summarizer.summarize_community = tracking_summarize
+
+        reports = summarizer.summarize_hierarchy(hierarchy, levels=[2])
+
+        # Only c2_top returned in output
+        assert set(reports.keys()) == {"top"}
+        # And Branch B communities were NEVER processed
+        assert "b1" not in processed_ids
+        assert "c1_b" not in processed_ids
+        # Branch A dependencies WERE processed
+        assert "a1" in processed_ids
+        assert "a2" in processed_ids
+        assert "c1_a" in processed_ids
+        assert "top" in processed_ids
