@@ -1017,6 +1017,7 @@ def summarize_hierarchy(
     llm: Optional[Any] = None,
     method: str = "default",
     max_tokens: int = 4000,
+    levels: Optional[List[int]] = None,
     **kwargs: Any,
 ) -> Dict[str, CommunityReport]:
     """
@@ -1028,6 +1029,7 @@ def summarize_hierarchy(
         llm: LLM provider instance, structured client, or callable
         method: Community summary method ("default", "summarizer", "llm")
         max_tokens: Maximum context token budget
+        levels: Optional subset of hierarchy levels to summarize
         **kwargs: Extra options passed to CommunitySummarizer
 
     Returns:
@@ -1048,6 +1050,7 @@ def summarize_hierarchy(
             llm=llm,
             fallback_on_custom_error=fallback,
             max_tokens=max_tokens,
+            levels=levels,
             **kwargs,
         )
         if result is not CUSTOM_METHOD_FELL_BACK:
@@ -1058,7 +1061,11 @@ def summarize_hierarchy(
             llm=llm, max_tokens=max_tokens, **kwargs
         )
         return summarizer.summarize_hierarchy(
-            hierarchy, graph=graph, max_tokens=max_tokens, **kwargs
+            hierarchy,
+            graph=graph,
+            levels=levels,
+            max_tokens=max_tokens,
+            **kwargs,
         )
     except Exception as e:
         logger.error(f"Failed to summarize hierarchy: {e}")

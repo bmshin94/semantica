@@ -69,7 +69,9 @@ class MethodRegistry:
         Register a custom KG method.
 
         Args:
-            task: Task type ("build", "analyze", "resolve", "validate", "centrality", "community", "connectivity", "temporal")
+            task: Task type ("build", "analyze", "resolve", "validate",
+                "centrality", "community", "connectivity", "temporal",
+                "community_hierarchy", "community_summary")
             name: Method name
             method_func: Method function
         """
@@ -83,7 +85,9 @@ class MethodRegistry:
         Get method by task and name.
 
         Args:
-            task: Task type ("build", "analyze", "resolve", "validate", "centrality", "community", "connectivity", "temporal")
+            task: Task type ("build", "analyze", "resolve", "validate",
+                "centrality", "community", "connectivity", "temporal",
+                "community_hierarchy", "community_summary")
             name: Method name
 
         Returns:
@@ -112,7 +116,10 @@ class MethodRegistry:
         Unregister a method.
 
         Args:
-            task: Task type ("build", "analyze", "resolve", "validate", "conflict", "centrality", "community", "connectivity", "deduplicate", "temporal")
+            task: Task type ("build", "analyze", "resolve", "validate",
+                "conflict", "centrality", "community", "connectivity",
+                "deduplicate", "temporal", "community_hierarchy",
+                "community_summary")
             name: Method name
         """
         if task in cls._methods and name in cls._methods[task]:

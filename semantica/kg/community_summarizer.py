@@ -47,7 +47,10 @@ def estimate_tokens(
     if not text:
         return 0
     if custom_counter is not None and callable(custom_counter):
-        return int(custom_counter(text))
+        try:
+            return max(0, int(custom_counter(text)))
+        except Exception:
+            pass
     return max(1, math.ceil(len(text) / 4.0))
 
 
@@ -79,10 +82,26 @@ class CommunityReport:
         self.community_id = str(self.community_id)
         self.level = int(self.level)
         self.title = str(self.title).strip()
+        if not self.title:
+            self.title = f"Community {self.community_id}"
         self.summary = str(self.summary).strip()
         self.rating_explanation = str(self.rating_explanation).strip()
-        self.impact_rating = max(1.0, min(10.0, float(self.impact_rating)))
-        self.rank = float(self.rank)
+
+        try:
+            r_val = float(self.impact_rating)
+            if math.isnan(r_val) or math.isinf(r_val):
+                r_val = 5.0
+        except (ValueError, TypeError):
+            r_val = 5.0
+        self.impact_rating = max(1.0, min(10.0, r_val))
+
+        try:
+            rank_val = float(self.rank)
+            if math.isnan(rank_val) or math.isinf(rank_val):
+                rank_val = 0.0
+        except (ValueError, TypeError):
+            rank_val = 0.0
+        self.rank = rank_val
 
         if self.member_entities:
             self.member_entities = sorted(
@@ -129,7 +148,10 @@ class CommunityReport:
             "level": self.level,
             "title": self.title,
             "summary": self.summary,
-            "findings": list(self.findings),
+            "findings": [
+                dict(item) if isinstance(item, dict) else item
+                for item in self.findings
+            ],
             "impact_rating": self.impact_rating,
             "rating_explanation": self.rating_explanation,
             "member_entities": list(self.member_entities),
@@ -152,12 +174,16 @@ class CommunityReport:
         embedding = (
             [float(x) for x in raw_embed] if raw_embed is not None else None
         )
+        findings = [
+            dict(item) if isinstance(item, dict) else item
+            for item in data.get("findings", [])
+        ]
         return cls(
             community_id=str(data.get("community_id", "")),
             level=int(data.get("level", 0)),
             title=str(data.get("title", "")),
             summary=str(data.get("summary", "")),
-            findings=list(data.get("findings", [])),
+            findings=findings,
             impact_rating=float(data.get("impact_rating", 5.0)),
             rating_explanation=str(data.get("rating_explanation", "")),
             member_entities=list(data.get("member_entities", [])),
@@ -205,12 +231,15 @@ class CommunityReport:
                         finding.get("summary")
                         or finding.get("title")
                         or finding.get("finding")
+                        or finding.get("name")
+                        or finding.get("claim")
                         or f"Finding {idx}"
                     )
                     explanation = (
                         finding.get("explanation")
                         or finding.get("description")
                         or finding.get("detail")
+                        or finding.get("evidence")
                         or ""
                     )
                     if explanation:
@@ -300,6 +329,8 @@ class CommunityReportLLMSchema(BaseModel):
                 val = float(v)
             except (ValueError, TypeError):
                 val = 5.0
+        if math.isnan(val) or math.isinf(val):
+            val = 5.0
         return max(1.0, min(10.0, val))
 
     @field_validator("rating_explanation", mode="before")
@@ -326,14 +357,43 @@ class CommunityReportLLMSchema(BaseModel):
                 else:
                     v = [{"summary": v.strip(), "explanation": ""}]
             except Exception:
-                v = [{"summary": v.strip(), "explanation": ""}]
+                # Check for bullet list in string
+                stripped = v.strip()
+                raw_lines = [
+                    ln.strip().lstrip("-* \t").strip()
+                    for ln in stripped.split("\n")
+                    if ln.strip()
+                ]
+                if len(raw_lines) > 1:
+                    v = [
+                        {"summary": ln, "explanation": ""}
+                        for ln in raw_lines
+                    ]
+                else:
+                    v = [{"summary": stripped, "explanation": ""}]
         elif not isinstance(v, list):
             return []
 
         normalized = []
         for item in v:
             if isinstance(item, dict):
-                normalized.append({str(k): val for k, val in item.items()})
+                d = {str(k): val for k, val in item.items()}
+                if "summary" not in d:
+                    d["summary"] = str(
+                        d.get("title")
+                        or d.get("finding")
+                        or d.get("name")
+                        or d.get("claim")
+                        or "Key Finding"
+                    )
+                if "explanation" not in d:
+                    d["explanation"] = str(
+                        d.get("description")
+                        or d.get("detail")
+                        or d.get("evidence")
+                        or ""
+                    )
+                normalized.append(d)
             elif isinstance(item, str):
                 normalized.append({"summary": item.strip(), "explanation": ""})
             else:
@@ -384,6 +444,13 @@ class CommunitySummarizer:
         if self.cache_dir is not None:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
 
+    def _cache_path(self, cache_key: str) -> Optional[Path]:
+        """Generate safe, traversal-proof cache file path."""
+        if self.cache_dir is None or not cache_key:
+            return None
+        safe_key = re.sub(r"[^\w\-]", "_", str(cache_key))
+        return self.cache_dir / f"{safe_key}.json"
+
     def get_cached_report(self, cache_key: str) -> Optional[CommunityReport]:
         """Retrieve a cached community report by SHA-256 content hash."""
         if not cache_key or not self.cache_enabled:
@@ -393,19 +460,18 @@ class CommunitySummarizer:
             if cache_key in self._memory_cache:
                 return self._memory_cache[cache_key]
 
-            if self.cache_dir is not None:
-                cache_file = self.cache_dir / f"{cache_key}.json"
-                if cache_file.exists():
-                    try:
-                        with open(cache_file, "r", encoding="utf-8") as f:
-                            data = json.load(f)
-                        report = CommunityReport.from_dict(data)
-                        self._memory_cache[cache_key] = report
-                        return report
-                    except Exception as e:
-                        self.logger.warning(
-                            f"Failed to read cache file {cache_file}: {e}"
-                        )
+            cache_file = self._cache_path(cache_key)
+            if cache_file is not None and cache_file.exists():
+                try:
+                    with open(cache_file, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    report = CommunityReport.from_dict(data)
+                    self._memory_cache[cache_key] = report
+                    return report
+                except Exception as e:
+                    self.logger.warning(
+                        f"Failed to read cache file {cache_file}: {e}"
+                    )
         return None
 
     def cache_report(self, cache_key: str, report: CommunityReport) -> None:
@@ -416,9 +482,9 @@ class CommunitySummarizer:
         with self._lock:
             self._memory_cache[cache_key] = report
 
-            if self.cache_dir is not None:
+            cache_file = self._cache_path(cache_key)
+            if cache_file is not None and self.cache_dir is not None:
                 self.cache_dir.mkdir(parents=True, exist_ok=True)
-                cache_file = self.cache_dir / f"{cache_key}.json"
                 temp_path = None
                 try:
                     with tempfile.NamedTemporaryFile(
@@ -451,16 +517,15 @@ class CommunitySummarizer:
                 del self._memory_cache[cache_key]
                 found = True
 
-            if self.cache_dir is not None:
-                cache_file = self.cache_dir / f"{cache_key}.json"
-                if cache_file.exists():
-                    try:
-                        cache_file.unlink()
-                        found = True
-                    except OSError as e:
-                        self.logger.warning(
-                            f"Failed to remove cache file {cache_file}: {e}"
-                        )
+            cache_file = self._cache_path(cache_key)
+            if cache_file is not None and cache_file.exists():
+                try:
+                    cache_file.unlink()
+                    found = True
+                except OSError as e:
+                    self.logger.warning(
+                        f"Failed to remove cache file {cache_file}: {e}"
+                    )
         return found
 
     def clear_cache(self) -> None:
@@ -576,11 +641,11 @@ class CommunitySummarizer:
                         "source": str(edge.get("source", "")),
                         "target": str(edge.get("target", "")),
                         "type": str(
-                            edge.get("attributes", {}).get(
+                            (edge.get("attributes") or {}).get(
                                 "type", "CONNECTED_TO"
                             )
                         ),
-                        **edge.get("attributes", {}),
+                        **(edge.get("attributes") or {}),
                     }
                     for edge in community.edges
                 ],
@@ -609,16 +674,21 @@ class CommunitySummarizer:
                 calculator.calculate_degree_centrality,
             )
             res = calc_func(subgraph)
-            if (
-                isinstance(res, dict)
-                and "centrality" in res
-                and isinstance(res["centrality"], dict)
-            ):
-                for k, v in res["centrality"].items():
-                    try:
-                        scores[str(k)] = float(v)
-                    except (ValueError, TypeError):
-                        pass
+            if isinstance(res, dict):
+                cent_dict = (
+                    res["centrality"]
+                    if (
+                        "centrality" in res
+                        and isinstance(res["centrality"], dict)
+                    )
+                    else res
+                )
+                if isinstance(cent_dict, dict):
+                    for k, v in cent_dict.items():
+                        try:
+                            scores[str(k)] = float(v)
+                        except (ValueError, TypeError):
+                            pass
         except Exception as e:
             self.logger.debug(f"Centrality calculation error: {e}")
 
@@ -632,9 +702,38 @@ class CommunitySummarizer:
         self,
         community: HierarchicalCommunity,
         child_reports: Optional[List[CommunityReport]] = None,
+        subgraph: Optional[Any] = None,
     ) -> List[Dict[str, Any]]:
         """Identify bridge edges connecting different sub-communities."""
         raw_edges = list(community.edges)
+        if not raw_edges and subgraph is not None:
+            if hasattr(subgraph, "edges"):
+                try:
+                    for u, v, d in subgraph.edges(data=True):
+                        d_dict = dict(d) if isinstance(d, dict) else {}
+                        raw_edges.append(
+                            {
+                                "source": str(u),
+                                "target": str(v),
+                                "type": str(
+                                    d_dict.get("type", "CONNECTED_TO")
+                                ),
+                                "attributes": d_dict,
+                            }
+                        )
+                except Exception as e:
+                    self.logger.debug(
+                        f"Failed extracting edges from subgraph: {e}"
+                    )
+            elif isinstance(subgraph, dict) and "relationships" in subgraph:
+                for rel in subgraph["relationships"]:
+                    if isinstance(rel, dict):
+                        raw_edges.append(rel)
+            elif hasattr(subgraph, "relationships"):
+                for rel in subgraph.relationships:
+                    if isinstance(rel, dict):
+                        raw_edges.append(rel)
+
         if not raw_edges or not child_reports:
             return raw_edges
 
@@ -655,7 +754,9 @@ class CommunitySummarizer:
             else:
                 internal_edges.append(e)
 
-        return bridge_edges if bridge_edges else internal_edges
+        if bridge_edges:
+            return bridge_edges + internal_edges
+        return internal_edges
 
     def _pack_context(
         self,
@@ -707,9 +808,17 @@ class CommunitySummarizer:
                                 f.get("summary")
                                 or f.get("title")
                                 or f.get("finding")
+                                or f.get("name")
+                                or f.get("claim")
                                 or ""
                             )
-                            e = f.get("explanation") or ""
+                            e = (
+                                f.get("explanation")
+                                or f.get("description")
+                                or f.get("detail")
+                                or f.get("evidence")
+                                or ""
+                            )
                             bullets.append(f"{s}: {e}".strip(": "))
                         else:
                             bullets.append(str(f))
@@ -729,13 +838,15 @@ class CommunitySummarizer:
 
         remaining_budget = available_budget - tokens_used_children
 
-        bridge_edges = self._identify_bridge_edges(community, child_reports)
+        bridge_edges = self._identify_bridge_edges(
+            community, child_reports, subgraph=subgraph
+        )
         bridge_edges.sort(
             key=lambda e: (
                 min(str(e.get("source", "")), str(e.get("target", ""))),
                 max(str(e.get("source", "")), str(e.get("target", ""))),
                 json.dumps(
-                    e.get("attributes", {}),
+                    e.get("attributes") or {},
                     sort_keys=True,
                     default=str,
                 ),
@@ -749,9 +860,10 @@ class CommunitySummarizer:
         for edge in bridge_edges:
             src = str(edge.get("source", ""))
             tgt = str(edge.get("target", ""))
+            attrs = edge.get("attributes") or {}
             rel_type = (
                 edge.get("type")
-                or edge.get("attributes", {}).get("type")
+                or attrs.get("type")
                 or "CONNECTED_TO"
             )
             edge_line = f"- ({src}) -[{rel_type}]-> ({tgt})\n"
@@ -812,25 +924,37 @@ class CommunitySummarizer:
         except Exception:
             pass
 
+        # Try markdown code fences ```json ... ```
         match = re.search(
-            r"```(?:json)?\s*(\{.*?\})\s*```", cleaned, re.DOTALL
+            r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned, re.DOTALL
         )
         if match:
+            block = match.group(1).strip()
             try:
-                val = json.loads(match.group(1))
+                val = json.loads(block)
                 if isinstance(val, dict):
                     return val
             except Exception:
-                pass
+                decoder = json.JSONDecoder()
+                for i in range(len(block)):
+                    if block[i] == "{":
+                        try:
+                            obj, _ = decoder.raw_decode(block[i:])
+                            if isinstance(obj, dict):
+                                return obj
+                        except Exception:
+                            pass
 
-        match = re.search(r"(\{.*\})", cleaned, re.DOTALL)
-        if match:
-            try:
-                val = json.loads(match.group(1))
-                if isinstance(val, dict):
-                    return val
-            except Exception:
-                pass
+        # Scan text for first valid JSON object using raw_decode
+        decoder = json.JSONDecoder()
+        for i in range(len(cleaned)):
+            if cleaned[i] == "{":
+                try:
+                    obj, _ = decoder.raw_decode(cleaned[i:])
+                    if isinstance(obj, dict):
+                        return obj
+                except Exception:
+                    pass
 
         raise ValueError(
             f"No valid JSON found in LLM output: {cleaned[:120]}..."
@@ -883,10 +1007,36 @@ class CommunitySummarizer:
             rating_explanation="Extractive baseline report.",
         )
 
+    def _coerce_to_schema(
+        self,
+        res: Any,
+        community: HierarchicalCommunity,
+    ) -> Optional[CommunityReportLLMSchema]:
+        """Coerce arbitrary response into CommunityReportLLMSchema."""
+        if isinstance(res, CommunityReportLLMSchema):
+            return res
+        if isinstance(res, dict):
+            return CommunityReportLLMSchema.model_validate(res)
+        if hasattr(res, "model_dump") and callable(res.model_dump):
+            return CommunityReportLLMSchema.model_validate(res.model_dump())
+        if hasattr(res, "__dict__"):
+            try:
+                return CommunityReportLLMSchema.model_validate(vars(res))
+            except Exception:
+                pass
+        if isinstance(res, str):
+            try:
+                parsed = self._extract_json(res)
+                return CommunityReportLLMSchema.model_validate(parsed)
+            except Exception:
+                return self._schema_from_freeform_text(res, community)
+        return None
+
     def _call_llm(
         self,
         prompt: str,
         community: HierarchicalCommunity,
+        **kwargs: Any,
     ) -> CommunityReportLLMSchema:
         """Invoke LLM via multi-tier unwrap strategy."""
         llm = self.llm
@@ -896,13 +1046,17 @@ class CommunitySummarizer:
         # Tier 1: llm.generate_typed
         if hasattr(llm, "generate_typed") and callable(llm.generate_typed):
             try:
-                res = llm.generate_typed(
-                    prompt, schema=CommunityReportLLMSchema
-                )
-                if isinstance(res, CommunityReportLLMSchema):
-                    return res
-                if isinstance(res, dict):
-                    return CommunityReportLLMSchema.model_validate(res)
+                try:
+                    res = llm.generate_typed(
+                        prompt, schema=CommunityReportLLMSchema, **kwargs
+                    )
+                except TypeError:
+                    res = llm.generate_typed(
+                        prompt, schema=CommunityReportLLMSchema
+                    )
+                schema = self._coerce_to_schema(res, community)
+                if schema is not None:
+                    return schema
             except Exception as e:
                 self.logger.warning(f"Tier 1 generate_typed failed: {e}")
 
@@ -913,13 +1067,17 @@ class CommunitySummarizer:
             and callable(llm.provider.generate_typed)
         ):
             try:
-                res = llm.provider.generate_typed(
-                    prompt, schema=CommunityReportLLMSchema
-                )
-                if isinstance(res, CommunityReportLLMSchema):
-                    return res
-                if isinstance(res, dict):
-                    return CommunityReportLLMSchema.model_validate(res)
+                try:
+                    res = llm.provider.generate_typed(
+                        prompt, schema=CommunityReportLLMSchema, **kwargs
+                    )
+                except TypeError:
+                    res = llm.provider.generate_typed(
+                        prompt, schema=CommunityReportLLMSchema
+                    )
+                schema = self._coerce_to_schema(res, community)
+                if schema is not None:
+                    return schema
             except Exception as e:
                 self.logger.warning(
                     f"Tier 2 provider.generate_typed failed: {e}"
@@ -930,50 +1088,41 @@ class CommunitySummarizer:
             llm.generate_structured
         ):
             try:
-                res = llm.generate_structured(prompt)
-                if isinstance(res, dict):
-                    return CommunityReportLLMSchema.model_validate(res)
+                try:
+                    res = llm.generate_structured(prompt, **kwargs)
+                except TypeError:
+                    res = llm.generate_structured(prompt)
+                schema = self._coerce_to_schema(res, community)
+                if schema is not None:
+                    return schema
                 if isinstance(res, list) and res and isinstance(res[0], dict):
                     return CommunityReportLLMSchema.model_validate(res[0])
-                if isinstance(res, str):
-                    parsed = self._extract_json(res)
-                    return CommunityReportLLMSchema.model_validate(parsed)
             except Exception as e:
                 self.logger.warning(f"Tier 3 generate_structured failed: {e}")
 
-        # Tier 4: llm.generate with regex parsing
+        # Tier 4: llm.generate with regex/JSON parsing
         if hasattr(llm, "generate") and callable(llm.generate):
             try:
-                text_res = llm.generate(prompt)
-                if isinstance(text_res, str):
-                    try:
-                        parsed = self._extract_json(text_res)
-                        return CommunityReportLLMSchema.model_validate(parsed)
-                    except Exception:
-                        return self._schema_from_freeform_text(
-                            text_res, community
-                        )
-                if isinstance(text_res, dict):
-                    return CommunityReportLLMSchema.model_validate(text_res)
+                try:
+                    text_res = llm.generate(prompt, **kwargs)
+                except TypeError:
+                    text_res = llm.generate(prompt)
+                schema = self._coerce_to_schema(text_res, community)
+                if schema is not None:
+                    return schema
             except Exception as e:
                 self.logger.warning(f"Tier 4 generate failed: {e}")
 
         # Tier 5: callable(llm)
         if callable(llm):
             try:
-                res = llm(prompt)
-                if isinstance(res, CommunityReportLLMSchema):
-                    return res
-                if isinstance(res, dict):
-                    return CommunityReportLLMSchema.model_validate(res)
-                if isinstance(res, str):
-                    try:
-                        parsed = self._extract_json(res)
-                        return CommunityReportLLMSchema.model_validate(parsed)
-                    except Exception:
-                        return self._schema_from_freeform_text(
-                            res, community
-                        )
+                try:
+                    res = llm(prompt, **kwargs)
+                except TypeError:
+                    res = llm(prompt)
+                schema = self._coerce_to_schema(res, community)
+                if schema is not None:
+                    return schema
             except Exception as e:
                 self.logger.warning(f"Tier 5 callable failed: {e}")
 
@@ -1006,7 +1155,16 @@ class CommunitySummarizer:
             CommunityReport object.
         """
         if isinstance(community, dict):
-            comm = HierarchicalCommunity.from_dict(community)
+            comm_data = dict(community)
+            if "id" not in comm_data:
+                comm_data["id"] = str(
+                    comm_data.get("community_id", "c_0")
+                )
+            if "level" not in comm_data:
+                comm_data["level"] = 0
+            if "index" not in comm_data:
+                comm_data["index"] = 0
+            comm = HierarchicalCommunity.from_dict(comm_data)
         elif isinstance(community, HierarchicalCommunity):
             comm = community
         else:
@@ -1053,7 +1211,17 @@ class CommunitySummarizer:
             "Return ONLY the structured JSON report."
         )
 
-        schema = self._call_llm(full_prompt, comm)
+        llm_kwargs = {
+            k: v for k, v in kwargs.items()
+            if k not in (
+                "rank",
+                "embedding",
+                "use_cache",
+                "child_reports",
+                "max_tokens",
+            )
+        }
+        schema = self._call_llm(full_prompt, comm, **llm_kwargs)
 
         rank = kwargs.get("rank")
         if rank is None:
@@ -1071,6 +1239,10 @@ class CommunitySummarizer:
             except Exception as e:
                 self.logger.warning(f"Embedder failed: {e}")
 
+        sub_comms = list(comm.child_ids)
+        if not sub_comms and child_reports:
+            sub_comms = [str(cr.community_id) for cr in child_reports]
+
         report = CommunityReport(
             community_id=str(comm.id),
             level=int(comm.level),
@@ -1081,7 +1253,7 @@ class CommunitySummarizer:
             rating_explanation=schema.rating_explanation,
             member_entities=list(comm.entity_ids),
             content_hash=content_hash,
-            sub_communities=list(comm.child_ids),
+            sub_communities=sub_comms,
             parent_id=comm.parent_id,
             rank=rank,
             embedding=embedding,
@@ -1129,6 +1301,16 @@ class CommunitySummarizer:
         )
 
         reports: Dict[str, CommunityReport] = {}
+        target_graph = (
+            graph if graph is not None else getattr(hierarchy, "_graph", None)
+        )
+        if target_graph is None:
+            target_graph = hierarchy
+
+        comm_kwargs = {
+            k: v for k, v in kwargs.items()
+            if k not in ("child_reports", "levels")
+        }
 
         # Bottom-up synthesis: process levels in order (0 -> max_level)
         for lvl in all_levels:
@@ -1140,11 +1322,11 @@ class CommunitySummarizer:
 
                 report = self.summarize_community(
                     community=comm,
-                    graph=graph,
+                    graph=target_graph,
                     child_reports=child_reps,
                     use_cache=use_cache,
                     max_tokens=max_tokens,
-                    **kwargs,
+                    **comm_kwargs,
                 )
                 reports[comm.id] = report
 

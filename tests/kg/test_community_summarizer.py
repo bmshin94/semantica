@@ -972,3 +972,193 @@ class TestRegistryAndWrappers:
         summarizer = CommunitySummarizer(embedder=fake_embedder)
         report = summarizer.summarize_community(comm)
         assert report.embedding == [0.1, 0.2, 0.3]
+
+
+# ---------------------------------------------------------------------------
+# Test Edge Cases and Bug Fixes
+# ---------------------------------------------------------------------------
+
+
+class TestEdgeCasesAndBugFixes:
+    """Tests for edge cases, sanitization, deep copy, and robust fallbacks."""
+
+    def test_edge_attributes_none_does_not_crash(self):
+        comm = HierarchicalCommunity(
+            id="c_edge_none",
+            level=0,
+            index=0,
+            entity_ids=["A", "B"],
+            edges=[{"source": "A", "target": "B", "attributes": None}],
+        )
+        summarizer = CommunitySummarizer()
+        subgraph = summarizer._extract_subgraph(comm, None)
+        ctx = summarizer._pack_context(comm, subgraph)
+        assert "CONNECTED_TO" in ctx
+
+    def test_bridge_edges_extracted_from_subgraph_when_edges_empty(self):
+        comm = HierarchicalCommunity(
+            id="c_no_edges",
+            level=0,
+            index=0,
+            entity_ids=["N1", "N2"],
+            edges=[],
+        )
+        g = nx.Graph()
+        g.add_edge("N1", "N2", type="RELATION")
+
+        summarizer = CommunitySummarizer()
+        subgraph = summarizer._extract_subgraph(comm, graph=g)
+        ctx = summarizer._pack_context(comm, subgraph)
+        assert "RELATION" in ctx
+
+    def test_summarize_hierarchy_propagates_graph(self):
+        comm = HierarchicalCommunity(
+            id="c_h_prop",
+            level=0,
+            index=0,
+            entity_ids=["X1", "X2"],
+            edges=[],
+        )
+        g = nx.Graph()
+        g.add_edge("X1", "X2", type="PROPAGATED_EDGE")
+        hierarchy = CommunityHierarchy(communities=[comm], graph=g)
+
+        recorded_prompts = []
+
+        def llm_check(prompt: str):
+            recorded_prompts.append(prompt)
+            return {"title": "Title", "summary": "Summary"}
+
+        summarizer = CommunitySummarizer(llm=llm_check)
+        reports = summarizer.summarize_hierarchy(hierarchy)
+        assert "c_h_prop" in reports
+        assert any("PROPAGATED_EDGE" in p for p in recorded_prompts)
+
+    def test_llm_kwargs_forwarded_to_provider(self):
+        comm = HierarchicalCommunity(
+            id="c_kwargs",
+            level=0,
+            index=0,
+            entity_ids=["E1"],
+        )
+        mock_llm = MagicMock()
+        mock_llm.generate_typed.return_value = CommunityReportLLMSchema(
+            title="Kwargs Passed",
+            summary="Checked kwargs",
+        )
+        summarizer = CommunitySummarizer(llm=mock_llm)
+        summarizer.summarize_community(
+            comm, temperature=0.3, max_retries=5
+        )
+        mock_llm.generate_typed.assert_called_once()
+        _, kwargs = mock_llm.generate_typed.call_args
+        assert kwargs.get("temperature") == 0.3
+        assert kwargs.get("max_retries") == 5
+
+    def test_loose_dictionary_community_input(self):
+        summarizer = CommunitySummarizer()
+        rep = summarizer.summarize_community(
+            {"id": "loose_comm", "entity_ids": ["L1", "L2"]}
+        )
+        assert rep.community_id == "loose_comm"
+        assert rep.level == 0
+        assert rep.member_entities == ["L1", "L2"]
+
+    def test_custom_centrality_direct_dict_output(self):
+        class DirectCalculator:
+            def calculate_degree_centrality(self, g):
+                return {"N1": 0.9, "N2": 0.1}
+
+        summarizer = CommunitySummarizer(
+            centrality_calculator=DirectCalculator()
+        )
+        scores = summarizer._compute_centrality(None, ["N1", "N2"])
+        assert scores["N1"] == 0.9
+        assert scores["N2"] == 0.1
+
+    def test_cache_key_sanitization_and_traversal_prevention(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            summarizer = CommunitySummarizer(cache_dir=tmpdir)
+            path = summarizer._cache_path("../../malicious:key")
+            assert path is not None
+            assert (
+                Path(tmpdir).resolve() in path.resolve().parents
+                or path.parent == Path(tmpdir)
+            )
+            assert ":" not in path.name
+            assert ".." not in str(path)
+
+    def test_to_dict_deep_copies_findings(self):
+        rep = CommunityReport(
+            community_id="c_copy",
+            level=0,
+            title="Copy Test",
+            summary="Summary",
+            findings=[{"summary": "Original", "explanation": "Detail"}],
+        )
+        d = rep.to_dict()
+        d["findings"][0]["summary"] = "Mutated"
+        assert rep.findings[0]["summary"] == "Original"
+
+    def test_nan_and_inf_ratings_normalized(self):
+        rep = CommunityReport(
+            community_id="c_nan",
+            level=0,
+            title="NaN Test",
+            summary="Summary",
+            impact_rating=float("nan"),
+            rank=float("inf"),
+        )
+        assert rep.impact_rating == 5.0
+        assert rep.rank == 0.0
+
+        schema = CommunityReportLLMSchema(impact_rating=float("nan"))
+        assert schema.impact_rating == 5.0
+
+    def test_sub_communities_populated_from_child_reports(self):
+        comm = HierarchicalCommunity(
+            id="c_parent_sub",
+            level=1,
+            index=0,
+            entity_ids=["P1"],
+            child_ids=[],
+        )
+        child_rep = CommunityReport(
+            community_id="c_child_sub",
+            level=0,
+            title="Child",
+            summary="Child summary",
+        )
+        summarizer = CommunitySummarizer()
+        rep = summarizer.summarize_community(
+            comm, child_reports=[child_rep]
+        )
+        assert rep.sub_communities == ["c_child_sub"]
+
+    def test_raw_decode_json_extraction_with_surrounding_noise(self):
+        summarizer = CommunitySummarizer()
+        messy_output = (
+            "Here is notes {and remarks}. The actual output:\n"
+            '{"title": "Messy JSON", "summary": "Parsed correctly", '
+            '"impact_rating": 8.0}\n'
+            "Additional explanation text {more notes}."
+        )
+        parsed = summarizer._extract_json(messy_output)
+        assert parsed["title"] == "Messy JSON"
+        assert parsed["impact_rating"] == 8.0
+
+    def test_estimate_tokens_counter_errors(self):
+        def bad_counter(text):
+            raise RuntimeError("Counter crashed")
+
+        assert estimate_tokens("Sample text", custom_counter=bad_counter) > 0
+
+        def negative_counter(text):
+            return -5
+
+        assert (
+            estimate_tokens(
+                "Sample text", custom_counter=negative_counter
+            )
+            == 0
+        )
