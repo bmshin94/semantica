@@ -1549,6 +1549,11 @@ def kg_global_cmd(
                 raise click.ClickException(
                     f"Failed to read reports file '{reports_path}': {exc}"
                 ) from exc
+        else:
+            raise click.ClickException(
+                "Global retrieval requires --reports. "
+                "Please provide a path to community reports."
+            )
 
         loaded_hierarchy = None
         if hierarchy_path:

@@ -265,8 +265,7 @@ class ContextRetriever:
                 **options,
             )
             merged = self._rank_and_merge(local_res + global_res, query)
-            filtered = [r for r in merged if r.score >= min_relevance_score]
-            return filtered[:max_results]
+            return merged[:max_results]
         elif norm_mode != "local":
             raise ValueError(
                 f"Unsupported retrieval mode '{mode}'. Supported modes: "
@@ -399,9 +398,10 @@ class ContextRetriever:
             **options,
         )
         if as_contexts:
+            context_threshold = max(0.0, min(1.0, min_relevance_score / 10.0))
             contexts = [
                 c for c in res.to_retrieved_contexts()
-                if c.score >= min_relevance_score
+                if c.score >= context_threshold
             ]
             return contexts[:max_results]
         return res
@@ -932,10 +932,29 @@ class ContextRetriever:
         self, results: List[RetrievedContext], query: str
     ) -> List[RetrievedContext]:
         """Rank and merge results from multiple sources with GraphRAG optimization."""
+        def is_graph_source(s: Optional[str]) -> bool:
+            if not s:
+                return False
+            return (
+                s.startswith("graph")
+                or s.startswith("global")
+                or s.startswith("drift")
+                or s.startswith("community")
+                or s in ("global_search", "drift_search", "local_graph")
+            )
+
         # Separate results by source (handle None source gracefully)
         vector_results = [r for r in results if r.source and r.source.startswith("vector:")]
-        graph_results = [r for r in results if r.source and r.source.startswith("graph:")]
+        graph_results = [r for r in results if is_graph_source(r.source)]
         memory_results = [r for r in results if r.source and r.source.startswith("memory:")]
+        other_results = [
+            r for r in results
+            if (
+                r not in vector_results
+                and r not in graph_results
+                and r not in memory_results
+            )
+        ]
         
         # Normalize scores within each source (0-1 range)
         def normalize_scores(source_results):
@@ -953,6 +972,7 @@ class ContextRetriever:
         vector_results = normalize_scores(vector_results)
         graph_results = normalize_scores(graph_results)
         memory_results = normalize_scores(memory_results)
+        other_results = normalize_scores(other_results)
         
         # Apply hybrid_alpha weighting: 0=vector only, 1=graph only, 0.5=balanced
         alpha = self.hybrid_alpha
@@ -968,16 +988,18 @@ class ContextRetriever:
             r.score += context_boost
         for r in memory_results:
             r.score = r.score * 0.3  # Lower weight for memory
+        for r in other_results:
+            r.score = r.score * 0.5  # Neutral weight for other
         
         # Deduplicate by entity ID (for graph) or content (for others)
         seen_entities = {}  # entity_id -> result
         seen_content = {}   # content_hash -> result
         
-        all_results = vector_results + graph_results + memory_results
+        all_results = vector_results + graph_results + memory_results + other_results
         
         for result in all_results:
             # For graph results, deduplicate by entity ID
-            if result.source and result.source.startswith("graph:"):
+            if is_graph_source(result.source):
                 entity_id = result.metadata.get("node_id")
                 if entity_id:
                     if entity_id not in seen_entities:
@@ -1011,7 +1033,7 @@ class ContextRetriever:
                                 if rel_key not in existing_rel_ids:
                                     existing.related_relationships.append(rel)
                                     existing_rel_ids.add(rel_key)
-                        continue
+                    continue
             
             # For non-graph results, deduplicate by content
             content_key = result.content[:100] if result.content else ""
@@ -1024,8 +1046,11 @@ class ContextRetriever:
         
         # Combine deduplicated results
         merged_results = list(seen_entities.values()) + [
-            r for r in seen_content.values() 
-            if not (r.source and r.source.startswith("graph:")) or r.metadata.get("node_id") not in seen_entities
+            r for r in seen_content.values()
+            if (
+                not is_graph_source(r.source)
+                or r.metadata.get("node_id") not in seen_entities
+            )
         ]
         
         # Re-rank with query relevance boost

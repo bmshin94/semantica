@@ -6,7 +6,7 @@ dynamic level selection, token budgeting, parallel Map execution, and
 dual-tier executive synthesis with explicit citations.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 import concurrent.futures
 from dataclasses import dataclass, field
 import json
@@ -15,7 +15,7 @@ import re
 import time
 from typing import Any, Dict, List, Optional, Sequence, Set, Union
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 from ..kg.community_hierarchy import CommunityHierarchy
 from ..kg.community_summarizer import CommunityReport, estimate_tokens
@@ -73,14 +73,18 @@ class MapKeyPoint:
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "MapKeyPoint":
         """Reconstruct MapKeyPoint from dictionary."""
+        score_val = d.get("relevance_score")
+        if score_val is None:
+            score_val = d.get("score")
+        level_val = d.get("level")
         return cls(
-            point=d.get("point", ""),
-            description=d.get("description", ""),
-            relevance_score=float(d.get("relevance_score", 5.0)),
-            community_id=str(d.get("community_id", "")),
-            level=int(d.get("level", 0)),
-            entities=list(d.get("entities", [])),
-            metadata=dict(d.get("metadata", {})),
+            point=str(d.get("point") or ""),
+            description=str(d.get("description") or ""),
+            relevance_score=float(score_val) if score_val is not None else 5.0,
+            community_id=str(d.get("community_id") or ""),
+            level=int(level_val) if level_val is not None else 0,
+            entities=list(d.get("entities") or []),
+            metadata=dict(d.get("metadata") or {}),
         )
 
 
@@ -94,7 +98,9 @@ class MapPointSchema(BaseModel):
         default="", description="Supporting explanation and context"
     )
     relevance_score: float = Field(
-        default=5.0, description="Relevance to query (0.0 to 10.0)"
+        default=5.0,
+        validation_alias=AliasChoices("relevance_score", "score"),
+        description="Relevance to query (0.0 to 10.0)",
     )
     entities: List[str] = Field(
         default_factory=list, description="Key entities mentioned"
@@ -358,7 +364,7 @@ class GlobalGraphRetriever:
         self.fixed_overhead = max(0, int(fixed_overhead))
         self.min_relevance_score = max(0.0, min(10.0, float(min_relevance_score)))
         self.max_workers = max(1, int(max_workers))
-        self.timeout = max(1.0, float(timeout))
+        self.timeout = max(0.001, float(timeout))
         self.auto_promote_level = bool(auto_promote_level)
         self.config = kwargs
 
@@ -385,7 +391,7 @@ class GlobalGraphRetriever:
                         loaded.append(rep)
                     elif isinstance(rep, dict):
                         loaded.append(CommunityReport.from_dict(rep))
-        elif isinstance(reports, (list, tuple)):
+        elif isinstance(reports, Iterable) and not isinstance(reports, (str, bytes)):
             for rep in reports:
                 if isinstance(rep, CommunityReport):
                     loaded.append(rep)
@@ -396,11 +402,15 @@ class GlobalGraphRetriever:
 
     def _estimate_report_tokens(self, report: CommunityReport) -> int:
         """Estimate token cost of a single community report."""
-        findings_str = " ".join(
-            f.get("summary", "") + " " + f.get("explanation", "")
-            for f in report.findings
-            if isinstance(f, dict)
-        )
+        findings_parts = []
+        for f in report.findings:
+            if isinstance(f, dict):
+                findings_parts.append(
+                    f.get("summary", "") + " " + f.get("explanation", "")
+                )
+            elif isinstance(f, str):
+                findings_parts.append(f)
+        findings_str = " ".join(findings_parts)
         full_text = f"{report.title}\n{report.summary}\n{findings_str}"
         return estimate_tokens(full_text, self.token_counter)
 
@@ -511,7 +521,7 @@ class GlobalGraphRetriever:
         accumulated_tokens = 0
         for _, rep in scored_candidates:
             cost = self._estimate_report_tokens(rep)
-            if accumulated_tokens + cost <= self.max_context_tokens or not retained:
+            if accumulated_tokens + cost <= self.max_context_tokens:
                 retained.append(rep)
                 accumulated_tokens += cost
             else:
@@ -671,17 +681,16 @@ class GlobalGraphRetriever:
         )
 
     def _call_map_llm(
-        self, prompt: str, report: CommunityReport, **kwargs: Any
+        self, prompt: str, report: CommunityReport, query: str = "", **kwargs: Any
     ) -> MapResponseSchema:
         """Execute 6-tier LLM unwrap for Map phase evaluation."""
         llm = kwargs.get("llm") or self.llm
+        fallback_query = query if query else prompt
         if llm is None:
-            return self._extractive_map_fallback(report, prompt)
+            return self._extractive_map_fallback(report, fallback_query)
 
         # Tier 1: llm.generate_typed
-        tier1_attempted = False
         if hasattr(llm, "generate_typed") and callable(llm.generate_typed):
-            tier1_attempted = True
             try:
                 try:
                     res = llm.generate_typed(
@@ -697,8 +706,7 @@ class GlobalGraphRetriever:
 
         # Tier 2: llm.provider.generate_typed
         if (
-            not tier1_attempted
-            and hasattr(llm, "provider")
+            hasattr(llm, "provider")
             and hasattr(llm.provider, "generate_typed")
             and callable(llm.provider.generate_typed)
         ):
@@ -760,7 +768,7 @@ class GlobalGraphRetriever:
 
         # Tier 6: Extractive keyword fallback
         self.logger.warning("All LLM tiers failed; using extractive Map fallback.")
-        return self._extractive_map_fallback(report, prompt)
+        return self._extractive_map_fallback(report, fallback_query)
 
     def _map_report(
         self, report: CommunityReport, query: str
@@ -794,7 +802,7 @@ class GlobalGraphRetriever:
             "'relevance_explanation'."
         )
 
-        response_schema = self._call_map_llm(prompt, report)
+        response_schema = self._call_map_llm(prompt, report, query=query)
 
         key_points: List[MapKeyPoint] = []
         for p in response_schema.points:
@@ -822,11 +830,10 @@ class GlobalGraphRetriever:
 
         all_points: List[MapKeyPoint] = []
         num_workers = min(self.max_workers, len(reports))
-        completed_communities: Set[str] = set()
+        completed_futures: Set[concurrent.futures.Future] = set()
 
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=num_workers
-        ) as executor:
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=num_workers)
+        try:
             future_to_report = {
                 executor.submit(self._map_report, rep, query): rep
                 for rep in reports
@@ -836,8 +843,8 @@ class GlobalGraphRetriever:
                 for future in concurrent.futures.as_completed(
                     future_to_report, timeout=self.timeout
                 ):
+                    completed_futures.add(future)
                     rep = future_to_report[future]
-                    completed_communities.add(rep.community_id)
                     try:
                         points = future.result()
                         all_points.extend(points)
@@ -866,8 +873,15 @@ class GlobalGraphRetriever:
                     f"Map phase reached timeout ({self.timeout}s); falling back to "
                     "extractive points for unfinished reports."
                 )
+                for f in future_to_report:
+                    f.cancel()
+                try:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                except TypeError:
+                    executor.shutdown(wait=False)
+
                 for future, rep in future_to_report.items():
-                    if rep.community_id not in completed_communities:
+                    if future not in completed_futures:
                         fallback_schema = self._extractive_map_fallback(rep, query)
                         for p in fallback_schema.points:
                             all_points.append(
@@ -883,6 +897,11 @@ class GlobalGraphRetriever:
                                     metadata={"source_title": rep.title},
                                 )
                             )
+        finally:
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                executor.shutdown(wait=False)
 
         return all_points
 
@@ -901,12 +920,12 @@ class GlobalGraphRetriever:
                 f"{kp.description} (relevance: {kp.relevance_score:.1f}/10)\n"
             )
             cost = estimate_tokens(line, self.token_counter)
-            if tokens_used + cost <= budget or not packed_lines:
+            if tokens_used + cost <= budget:
                 packed_lines.append(line)
                 retained_points.append(kp)
                 tokens_used += cost
             else:
-                break
+                continue
 
         return ("".join(packed_lines), retained_points)
 
@@ -949,7 +968,7 @@ class GlobalGraphRetriever:
             elif callable(llm):
                 res = llm(prompt)
             else:
-                res = str(llm)
+                raise TypeError(f"Unsupported LLM type: {type(llm)}")
             if isinstance(res, dict):
                 return str(
                     res.get("text")
@@ -1017,6 +1036,7 @@ class GlobalGraphRetriever:
                     "reports_mapped": 0,
                     "key_points_generated": 0,
                     "key_points_retained": 0,
+                    "citations_count": 0,
                 },
             )
 
@@ -1034,16 +1054,56 @@ class GlobalGraphRetriever:
         )
 
         # Reduce phase token budget
-        reduce_budget = max(
-            100,
+        remaining_budget = (
             self.max_context_tokens
             - self.fixed_overhead
-            - self.response_token_budget,
+            - self.response_token_budget
         )
+        if remaining_budget <= 0:
+            duration = time.time() - start_time
+            return GlobalSearchResult(
+                query=query,
+                response="No sufficiently relevant community findings were available.",
+                level=selected_level,
+                key_points=[],
+                community_reports_used=[],
+                citations=[],
+                metrics={
+                    "time_taken": duration,
+                    "level_used": selected_level,
+                    "reports_evaluated": len(candidate_reports),
+                    "reports_mapped": len(candidate_reports),
+                    "key_points_generated": len(raw_key_points),
+                    "key_points_retained": 0,
+                    "citations_count": 0,
+                },
+            )
+
+        reduce_budget = remaining_budget
 
         packed_context, retained_points = self._pack_reduce_context(
             filtered_points, reduce_budget
         )
+
+        if not retained_points:
+            duration = time.time() - start_time
+            return GlobalSearchResult(
+                query=query,
+                response="No sufficiently relevant community findings were available.",
+                level=selected_level,
+                key_points=[],
+                community_reports_used=[],
+                citations=[],
+                metrics={
+                    "time_taken": duration,
+                    "level_used": selected_level,
+                    "reports_evaluated": len(candidate_reports),
+                    "reports_mapped": len(candidate_reports),
+                    "key_points_generated": len(raw_key_points),
+                    "key_points_retained": 0,
+                    "citations_count": 0,
+                },
+            )
 
         # Executive Reduce synthesis
         response_text = self._synthesize_reduce(query, packed_context, retained_points)
@@ -1052,9 +1112,14 @@ class GlobalGraphRetriever:
         raw_citations = re.findall(
             r"\[Community\s+([A-Za-z0-9_\-]+)\]", response_text, re.IGNORECASE
         )
-        citations = sorted(set(str(c) for c in raw_citations))
-        if not citations and retained_points:
-            citations = sorted(set(kp.community_id for kp in retained_points))
+        valid_ids = {
+            str(kp.community_id)
+            for kp in retained_points
+            if kp.community_id is not None and str(kp.community_id).strip()
+        }
+        citations = sorted(set(str(c) for c in raw_citations if str(c) in valid_ids))
+        if not citations and valid_ids:
+            citations = sorted(valid_ids)
 
         reports_used = sorted(set(r.community_id for r in candidate_reports))
 

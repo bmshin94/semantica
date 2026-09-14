@@ -140,6 +140,7 @@ from .global_retriever import (
     GlobalGraphRetriever,
     GlobalSearchResult,
     MapKeyPoint,
+    MapPointSchema,
     MapResponseSchema,
 )
 from .drift_search import (
@@ -210,6 +211,7 @@ __all__ = [
     "GlobalGraphRetriever",
     "GlobalSearchResult",
     "MapKeyPoint",
+    "MapPointSchema",
     "MapResponseSchema",
     "DriftSearchEngine",
     "DriftSearchResult",

@@ -183,3 +183,11 @@ class TestCliGraphRAG:
                 ["kg", "drift", "query", "--graph", str(bad_path)],
             )
             assert result.exit_code != 0
+
+    def test_kg_global_without_reports_raises_error(self, runner: CliRunner):
+        result = runner.invoke(
+            cli_module.main,
+            ["kg", "global", "query"],
+        )
+        assert result.exit_code != 0
+        assert "Global retrieval requires --reports" in result.output
