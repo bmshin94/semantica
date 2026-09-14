@@ -61,6 +61,8 @@ class MethodRegistry:
         "temporal": {},
         "community_hierarchy": {},
         "community_summary": {},
+        "global_retrieval": {},
+        "drift_search": {},
     }
 
     @classmethod
@@ -189,6 +191,8 @@ class AlgorithmRegistry:
             "community_detection": {},
             "community_hierarchy": {},
             "community_summary": {},
+            "global_retrieval": {},
+            "drift_search": {},
         }
         self._metadata = {}
         self._capabilities = {}
@@ -610,6 +614,46 @@ class AlgorithmRegistry:
                     "hierarchical_synthesis",
                 ],
             )
+
+        # Global GraphRAG retrieval
+        self.register(
+            "global_retrieval",
+            "default",
+            None,
+            metadata={
+                "description": "Global Map-Reduce query retrieval over reports",
+                "parameters": ["query", "reports", "hierarchy", "llm"],
+                "complexity": "O(C)",
+                "quality": "High",
+                "use_case": "Macro-level executive query answering",
+            },
+            capabilities=[
+                "map_reduce",
+                "level_promotion",
+                "token_budgeting",
+                "citations",
+            ],
+        )
+
+        # DRIFT hybrid search
+        self.register(
+            "drift_search",
+            "default",
+            None,
+            metadata={
+                "description": "DRIFT hybrid global-local search engine",
+                "parameters": ["query", "knowledge_graph", "reports", "llm"],
+                "complexity": "O(K + E)",
+                "quality": "High",
+                "use_case": "Directed reasoning and drift-pruned traversal",
+            },
+            capabilities=[
+                "thematic_framing",
+                "directed_reasoning",
+                "drift_pruning",
+                "dual_attribution",
+            ],
+        )
 
 
 # Global algorithm registry

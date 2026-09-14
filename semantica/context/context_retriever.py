@@ -122,12 +122,22 @@ class ContextRetriever:
     • Real-time context updates
     """
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None, **kwargs):
+    def __init__(
+        self,
+        config: Optional[Dict[str, Any]] = None,
+        community_hierarchy: Optional[Any] = None,
+        community_reports: Optional[Any] = None,
+        llm: Optional[Any] = None,
+        **kwargs,
+    ):
         """
         Initialize context retriever.
 
         Args:
             config: Configuration dictionary
+            community_hierarchy: Optional CommunityHierarchy instance
+            community_reports: Optional community reports collection
+            llm: Optional LLM instance for global/drift synthesis
             **kwargs: Additional configuration options:
                 - memory_store: Memory store instance
                 - knowledge_graph: Knowledge graph instance
@@ -145,6 +155,22 @@ class ContextRetriever:
         self.knowledge_graph = self.config.get("knowledge_graph")
         self.vector_store = self.config.get("vector_store")
 
+        self.community_hierarchy = (
+            community_hierarchy
+            if community_hierarchy is not None
+            else self.config.get("community_hierarchy")
+        )
+        self.community_reports = (
+            community_reports
+            if community_reports is not None
+            else self.config.get("community_reports")
+        )
+        self.llm = (
+            llm
+            if llm is not None
+            else self.config.get("llm")
+        )
+
         self.use_graph_expansion = self.config.get("use_graph_expansion", True)
         self.max_expansion_hops = self.config.get("max_expansion_hops", 2)
         self.hybrid_alpha = self.config.get("hybrid_alpha", 0.5)
@@ -158,7 +184,7 @@ class ContextRetriever:
         # Initialize decision-specific components
         self.hybrid_calculator = HybridSimilarityCalculator()
         self.decision_pipeline: Optional[DecisionEmbeddingPipeline] = None
-        
+
         # Initialize KG algorithms if knowledge graph available
         if self.knowledge_graph:
             self.path_finder = PathFinder()
@@ -170,7 +196,7 @@ class ContextRetriever:
             self.centrality_calculator = None
             self.community_detector = None
             self.similarity_calculator = None
-        
+
         # Initialize decision pipeline if vector store available
         if self.vector_store:
             self.decision_pipeline = DecisionEmbeddingPipeline(
@@ -185,6 +211,7 @@ class ContextRetriever:
         max_results: int = 5,
         use_graph_expansion: Optional[bool] = None,
         min_relevance_score: float = 0.0,
+        mode: str = "local",
         **options,
     ) -> List[RetrievedContext]:
         """
@@ -195,6 +222,7 @@ class ContextRetriever:
             max_results: Maximum number of results
             use_graph_expansion: Use graph expansion (overrides config)
             min_relevance_score: Minimum relevance score
+            mode: Retrieval mode ('local', 'global', 'drift', 'hybrid')
             **options: Additional options:
                 - entity_ids: Filter by entity IDs
                 - node_types: Filter by node types
@@ -203,6 +231,48 @@ class ContextRetriever:
         Returns:
             List of retrieved context items
         """
+        norm_mode = str(mode).lower().strip()
+        if norm_mode == "global":
+            return self.retrieve_global(
+                query,
+                max_results=max_results,
+                min_relevance_score=min_relevance_score,
+                as_contexts=True,
+                **options,
+            )
+        elif norm_mode == "drift":
+            return self.retrieve_drift(
+                query,
+                max_results=max_results,
+                min_relevance_score=min_relevance_score,
+                as_contexts=True,
+                **options,
+            )
+        elif norm_mode == "hybrid":
+            local_res = self.retrieve(
+                query,
+                max_results=max_results * 2,
+                use_graph_expansion=use_graph_expansion,
+                min_relevance_score=min_relevance_score,
+                mode="local",
+                **options,
+            )
+            global_res = self.retrieve_global(
+                query,
+                max_results=max_results * 2,
+                min_relevance_score=min_relevance_score,
+                as_contexts=True,
+                **options,
+            )
+            merged = self._rank_and_merge(local_res + global_res, query)
+            filtered = [r for r in merged if r.score >= min_relevance_score]
+            return filtered[:max_results]
+        elif norm_mode != "local":
+            raise ValueError(
+                f"Unsupported retrieval mode '{mode}'. Supported modes: "
+                "'local', 'global', 'drift', 'hybrid'"
+            )
+
         # Track context retrieval
         tracking_id = self.progress_tracker.start_tracking(
             file=None,
@@ -274,6 +344,130 @@ class ContextRetriever:
                 tracking_id, status="failed", message=str(e)
             )
             raise
+
+    def retrieve_global(
+        self,
+        query: str,
+        level: Optional[int] = None,
+        max_results: int = 5,
+        min_relevance_score: float = 0.0,
+        as_contexts: bool = False,
+        **options,
+    ) -> Union[Any, List[RetrievedContext]]:
+        """
+        Execute global search over community reports.
+
+        Args:
+            query: Search query
+            level: Target coarsening hierarchy level
+            max_results: Maximum results when returning contexts
+            min_relevance_score: Minimum relevance score
+            as_contexts: If True, return List[RetrievedContext];
+                if False, return GlobalSearchResult
+            **options: Additional options passed to GlobalGraphRetriever
+
+        Returns:
+            GlobalSearchResult or List[RetrievedContext]
+        """
+        from .global_retriever import GlobalGraphRetriever
+
+        reports = options.pop("reports", None)
+        if reports is None:
+            reports = options.pop("community_reports", self.community_reports)
+        else:
+            options.pop("community_reports", None)
+
+        hierarchy = options.pop("hierarchy", None)
+        if hierarchy is None:
+            hierarchy = options.pop("community_hierarchy", self.community_hierarchy)
+        else:
+            options.pop("community_hierarchy", None)
+
+        llm = options.pop("llm", self.llm)
+
+        retriever = GlobalGraphRetriever(
+            reports=reports,
+            hierarchy=hierarchy,
+            llm=llm,
+            min_relevance_score=min_relevance_score,
+            **options,
+        )
+        res = retriever.search(
+            query,
+            level=level,
+            min_relevance_score=min_relevance_score,
+            **options,
+        )
+        if as_contexts:
+            contexts = [
+                c for c in res.to_retrieved_contexts()
+                if c.score >= min_relevance_score
+            ]
+            return contexts[:max_results]
+        return res
+
+    def retrieve_drift(
+        self,
+        query: str,
+        max_depth: int = 2,
+        max_results: int = 5,
+        min_relevance_score: float = 0.0,
+        as_contexts: bool = False,
+        **options,
+    ) -> Union[Any, List[RetrievedContext]]:
+        """
+        Execute DRIFT hybrid search combining global framing and local graph traversal.
+
+        Args:
+            query: Search query
+            max_depth: Maximum graph expansion depth
+            max_results: Maximum results when returning contexts
+            min_relevance_score: Minimum relevance score
+            as_contexts: If True, return List[RetrievedContext];
+                if False, return DriftSearchResult
+            **options: Additional options passed to DriftSearchEngine
+
+        Returns:
+            DriftSearchResult or List[RetrievedContext]
+        """
+        from .drift_search import DriftSearchEngine
+
+        kg = options.pop("knowledge_graph", None)
+        if kg is None:
+            kg = options.pop("graph", self.knowledge_graph)
+        else:
+            options.pop("graph", None)
+
+        reports = options.pop("reports", None)
+        if reports is None:
+            reports = options.pop("community_reports", self.community_reports)
+        else:
+            options.pop("community_reports", None)
+
+        hierarchy = options.pop("hierarchy", None)
+        if hierarchy is None:
+            hierarchy = options.pop("community_hierarchy", self.community_hierarchy)
+        else:
+            options.pop("community_hierarchy", None)
+
+        llm = options.pop("llm", self.llm)
+
+        engine = DriftSearchEngine(
+            knowledge_graph=kg,
+            reports=reports,
+            hierarchy=hierarchy,
+            llm=llm,
+            max_depth=max_depth,
+            **options,
+        )
+        res = engine.search(query, max_depth=max_depth, **options)
+        if as_contexts:
+            contexts = [
+                c for c in res.to_retrieved_contexts()
+                if c.score >= min_relevance_score
+            ]
+            return contexts[:max_results]
+        return res
 
     def _retrieve_from_vector(
         self, query: str, max_results: int
