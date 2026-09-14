@@ -260,10 +260,19 @@ class CommunityReport:
             norm_findings = []
             for item in self.findings:
                 if isinstance(item, dict):
-                    norm_findings.append(
-                        {str(k): v for k, v in item.items()}
-                    )
-                else:
+                    entry = {str(k): v for k, v in item.items()}
+                    if "summary" in entry:
+                        entry["summary"] = (
+                            "" if entry["summary"] is None else str(entry["summary"])
+                        )
+                    if "explanation" in entry:
+                        entry["explanation"] = (
+                            ""
+                            if entry["explanation"] is None
+                            else str(entry["explanation"])
+                        )
+                    norm_findings.append(entry)
+                elif item is not None:
                     norm_findings.append(
                         {"summary": str(item), "explanation": ""}
                     )

@@ -265,7 +265,13 @@ class ContextRetriever:
                 **options,
             )
             merged = self._rank_and_merge(local_res + global_res, query)
-            return merged[:max_results]
+            eff_min_score = (
+                max(0.0, min(1.0, min_relevance_score / 10.0))
+                if min_relevance_score > 1.0
+                else max(0.0, min(1.0, min_relevance_score))
+            )
+            filtered = [r for r in merged if r.score >= eff_min_score]
+            return filtered[:max_results]
         elif norm_mode != "local":
             raise ValueError(
                 f"Unsupported retrieval mode '{mode}'. Supported modes: "
@@ -326,8 +332,13 @@ class ContextRetriever:
             ranked_results = self._rank_and_merge(all_results, query)
 
             # Filter by minimum score
+            eff_min_score = (
+                max(0.0, min(1.0, min_relevance_score / 10.0))
+                if min_relevance_score > 1.0
+                else max(0.0, min(1.0, min_relevance_score))
+            )
             filtered_results = [
-                r for r in ranked_results if r.score >= min_relevance_score
+                r for r in ranked_results if r.score >= eff_min_score
             ]
 
             self.progress_tracker.stop_tracking(
@@ -398,7 +409,11 @@ class ContextRetriever:
             **options,
         )
         if as_contexts:
-            context_threshold = max(0.0, min(1.0, min_relevance_score / 10.0))
+            context_threshold = (
+                max(0.0, min(1.0, min_relevance_score / 10.0))
+                if min_relevance_score > 1.0
+                else max(0.0, min(1.0, min_relevance_score))
+            )
             contexts = [
                 c for c in res.to_retrieved_contexts()
                 if c.score >= context_threshold
@@ -462,9 +477,14 @@ class ContextRetriever:
         )
         res = engine.search(query, max_depth=max_depth, **options)
         if as_contexts:
+            context_threshold = (
+                max(0.0, min(1.0, min_relevance_score / 10.0))
+                if min_relevance_score > 1.0
+                else max(0.0, min(1.0, min_relevance_score))
+            )
             contexts = [
                 c for c in res.to_retrieved_contexts()
-                if c.score >= min_relevance_score
+                if c.score >= context_threshold
             ]
             return contexts[:max_results]
         return res
@@ -958,38 +978,58 @@ class ContextRetriever:
         
         # Normalize scores within each source (0-1 range)
         def normalize_scores(source_results):
-            if not source_results:
+            unweighted = [
+                r for r in source_results
+                if not (r.metadata and r.metadata.get("_source_weighted"))
+            ]
+            if not unweighted:
                 return source_results
-            scores = [r.score for r in source_results]
+            scores = [r.score for r in unweighted]
             if not scores:
                 return source_results
             min_score, max_score = min(scores), max(scores)
             if max_score > min_score:
-                for r in source_results:
+                for r in unweighted:
                     r.score = (r.score - min_score) / (max_score - min_score)
             return source_results
-        
+
         vector_results = normalize_scores(vector_results)
         graph_results = normalize_scores(graph_results)
         memory_results = normalize_scores(memory_results)
         other_results = normalize_scores(other_results)
-        
+
         # Apply hybrid_alpha weighting: 0=vector only, 1=graph only, 0.5=balanced
         alpha = self.hybrid_alpha
         for r in vector_results:
-            r.score = r.score * (1 - alpha)  # Weight vector results
+            if r.metadata is None:
+                r.metadata = {}
+            if not r.metadata.get("_source_weighted"):
+                r.score = r.score * (1 - alpha)  # Weight vector results
+                r.metadata["_source_weighted"] = True
         for r in graph_results:
-            r.score = r.score * alpha  # Weight graph results
-            # Boost graph results with more context (more related entities/relationships)
-            context_boost = min(
-                0.2,  # Max 20% boost
-                (len(r.related_entities) + len(r.related_relationships or [])) * 0.01
-            )
-            r.score += context_boost
+            if r.metadata is None:
+                r.metadata = {}
+            if not r.metadata.get("_source_weighted"):
+                r.score = r.score * alpha  # Weight graph results
+                # Boost graph results with more context
+                context_boost = min(
+                    0.2,  # Max 20% boost
+                    (len(r.related_entities) + len(r.related_relationships or [])) * 0.01
+                )
+                r.score += context_boost
+                r.metadata["_source_weighted"] = True
         for r in memory_results:
-            r.score = r.score * 0.3  # Lower weight for memory
+            if r.metadata is None:
+                r.metadata = {}
+            if not r.metadata.get("_source_weighted"):
+                r.score = r.score * 0.3  # Lower weight for memory
+                r.metadata["_source_weighted"] = True
         for r in other_results:
-            r.score = r.score * 0.5  # Neutral weight for other
+            if r.metadata is None:
+                r.metadata = {}
+            if not r.metadata.get("_source_weighted"):
+                r.score = r.score * 0.5  # Neutral weight for other
+                r.metadata["_source_weighted"] = True
         
         # Deduplicate by entity ID (for graph) or content (for others)
         seen_entities = {}  # entity_id -> result

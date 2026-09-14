@@ -40,7 +40,9 @@ class MapKeyPoint:
     def __post_init__(self) -> None:
         self.point = str(self.point).strip()
         self.description = str(self.description).strip()
-        self.community_id = str(self.community_id).strip()
+        self.community_id = (
+            "" if self.community_id is None else str(self.community_id).strip()
+        )
         self.level = int(self.level)
         try:
             r_val = float(self.relevance_score)
@@ -405,13 +407,15 @@ class GlobalGraphRetriever:
         findings_parts = []
         for f in report.findings:
             if isinstance(f, dict):
-                findings_parts.append(
-                    f.get("summary", "") + " " + f.get("explanation", "")
-                )
-            elif isinstance(f, str):
-                findings_parts.append(f)
+                s = str(f.get("summary") or "")
+                e = str(f.get("explanation") or "")
+                part = f"{s} {e}".strip()
+                if part:
+                    findings_parts.append(part)
+            elif f is not None:
+                findings_parts.append(str(f))
         findings_str = " ".join(findings_parts)
-        full_text = f"{report.title}\n{report.summary}\n{findings_str}"
+        full_text = f"{report.title or ''}\n{report.summary or ''}\n{findings_str}"
         return estimate_tokens(full_text, self.token_counter)
 
     def _group_reports_by_level(self) -> Dict[int, List[CommunityReport]]:
@@ -636,17 +640,28 @@ class GlobalGraphRetriever:
 
         for finding in report.findings:
             if isinstance(finding, dict):
-                f_summary = (
+                f_summary = str(
                     finding.get("summary")
-                    or finding.get("title")
-                    or finding.get("finding")
-                    or ""
-                )
-                f_expl = (
+                    if finding.get("summary") is not None
+                    else (
+                        finding.get("title")
+                        if finding.get("title") is not None
+                        else (
+                            finding.get("finding")
+                            if finding.get("finding") is not None
+                            else ""
+                        )
+                    )
+                ).strip()
+                f_expl = str(
                     finding.get("explanation")
-                    or finding.get("description")
-                    or ""
-                )
+                    if finding.get("explanation") is not None
+                    else (
+                        finding.get("description")
+                        if finding.get("description") is not None
+                        else ""
+                    )
+                ).strip()
                 f_words = _extract_words(f"{f_summary} {f_expl}")
                 f_overlap = len(query_words & f_words) if query_words else 0
                 f_score = (
@@ -777,11 +792,16 @@ class GlobalGraphRetriever:
         findings_bullets = []
         for f in report.findings:
             if isinstance(f, dict):
-                s = f.get("summary", "")
-                e = f.get("explanation", "")
-                findings_bullets.append(f"- {s}: {e}".strip(": "))
-            else:
-                findings_bullets.append(f"- {f}")
+                s = str(f.get("summary") or "").strip()
+                e = str(f.get("explanation") or "").strip()
+                if s and e:
+                    findings_bullets.append(f"- {s}: {e}")
+                elif s:
+                    findings_bullets.append(f"- {s}")
+                elif e:
+                    findings_bullets.append(f"- {e}")
+            elif f is not None:
+                findings_bullets.append(f"- {str(f).strip()}")
         findings_text = "\n".join(findings_bullets) if findings_bullets else "None"
 
         entities_preview = ", ".join(report.member_entities[:10])
@@ -929,6 +949,71 @@ class GlobalGraphRetriever:
 
         return ("".join(packed_lines), retained_points)
 
+    def _ensure_evidence_citations(
+        self, response_text: str, key_points: List[MapKeyPoint]
+    ) -> str:
+        """Validate and append missing community and member-entity citations."""
+        if not key_points:
+            return response_text
+
+        grouped_by_comm: Dict[str, List[MapKeyPoint]] = {}
+        for kp in key_points:
+            cid = str(kp.community_id).strip() if kp.community_id is not None else ""
+            if cid and cid != "None":
+                grouped_by_comm.setdefault(cid, []).append(kp)
+
+        missing_entries: List[str] = []
+        for comm_id, pts in grouped_by_comm.items():
+            has_comm_citation = bool(
+                re.search(
+                    rf"\[Community\s+{re.escape(comm_id)}\]",
+                    response_text,
+                    re.IGNORECASE,
+                )
+            )
+            comm_ents: List[str] = []
+            for p in pts:
+                for e in (p.entities or []):
+                    if e and e not in comm_ents:
+                        comm_ents.append(e)
+
+            has_entity_mention = bool(
+                not comm_ents
+                or any(
+                    bool(
+                        re.search(
+                            rf"\b{re.escape(e)}\b", response_text, re.IGNORECASE
+                        )
+                    )
+                    for e in comm_ents
+                )
+            )
+
+            if not has_comm_citation or not has_entity_mention:
+                ents_label = (
+                    f" (Entities: {', '.join(comm_ents)})" if comm_ents else ""
+                )
+                pts_summary = (
+                    "; ".join(p.point for p in pts if p.point)
+                    or "; ".join(p.description for p in pts if p.description)
+                    or "Supporting findings"
+                )
+                missing_entries.append(
+                    f"- [Community {comm_id}]{ents_label}: {pts_summary}"
+                )
+
+        if not missing_entries:
+            return response_text
+
+        to_append = [e for e in missing_entries if e not in response_text]
+        if not to_append:
+            return response_text
+
+        prefix = f"{response_text.rstrip()}\n\n" if response_text.strip() else ""
+        if "Sources / Evidence:" in response_text:
+            return f"{response_text.rstrip()}\n" + "\n".join(to_append)
+        return prefix + "Sources / Evidence:\n" + "\n".join(to_append)
+
     def _synthesize_reduce(
         self, query: str, context_text: str, key_points: List[MapKeyPoint]
     ) -> str:
@@ -936,18 +1021,38 @@ class GlobalGraphRetriever:
         llm = self.llm
         if llm is None:
             # Deterministic synthesis fallback
-            grouped_by_comm: Dict[str, List[str]] = {}
+            grouped_by_comm: Dict[str, List[tuple[str, List[str]]]] = {}
             for kp in key_points:
-                grouped_by_comm.setdefault(kp.community_id, []).append(
-                    f"{kp.point}: {kp.description}".strip(": ")
+                cid = (
+                    str(kp.community_id).strip()
+                    if kp.community_id is not None
+                    else ""
+                )
+                if not cid or cid == "None":
+                    cid = "Unknown"
+                grouped_by_comm.setdefault(cid, []).append(
+                    (
+                        f"{kp.point}: {kp.description}".strip(": "),
+                        kp.entities or [],
+                    )
                 )
 
             lines = [f"Executive Synthesis for query: '{query}'\n"]
-            for comm_id, pts in grouped_by_comm.items():
-                lines.append(f"From [Community {comm_id}]:")
-                for pt in pts:
-                    lines.append(f"  • {pt}")
-            return "\n".join(lines)
+            for comm_id, pts_with_ents in grouped_by_comm.items():
+                all_ents: List[str] = []
+                for _, ents in pts_with_ents:
+                    for e in ents:
+                        if e and e not in all_ents:
+                            all_ents.append(e)
+                ents_hdr = f" (Entities: {', '.join(all_ents)})" if all_ents else ""
+                lines.append(f"From [Community {comm_id}]{ents_hdr}:")
+                for pt, ents in pts_with_ents:
+                    ents_str = (
+                        f" (Entities: {', '.join(ents)})" if ents else ""
+                    )
+                    lines.append(f"  • {pt}{ents_str}")
+            raw_response = "\n".join(lines)
+            return self._ensure_evidence_citations(raw_response, key_points)
 
         prompt = (
             "You are an executive knowledge analyst synthesizing global findings.\n\n"
@@ -956,9 +1061,10 @@ class GlobalGraphRetriever:
             "Instructions:\n"
             "1. Synthesize a comprehensive, executive-level answer that directly "
             "answers the query.\n"
-            "2. You MUST cite the source communities using [Community <id>] whenever "
+            "2. You MUST cite each source community using [Community <id>] whenever "
             "making assertions.\n"
-            "3. Mention key entities in parentheses where appropriate.\n"
+            "3. You MUST cite key member entities (Entities: <entity1>, <entity2>) "
+            "in parentheses alongside the community citations.\n"
             "4. Provide a coherent, well-structured response."
         )
 
@@ -970,20 +1076,53 @@ class GlobalGraphRetriever:
             else:
                 raise TypeError(f"Unsupported LLM type: {type(llm)}")
             if isinstance(res, dict):
-                return str(
+                raw_text = str(
                     res.get("text")
                     or res.get("response")
                     or res.get("content")
                     or json.dumps(res)
                 )
-            return str(res).strip()
+            else:
+                raw_text = str(res).strip()
+            return self._ensure_evidence_citations(raw_text, key_points)
         except Exception as e:
             self.logger.warning(f"Reduce LLM synthesis failed: {e}")
             # Deterministic fallback
-            return (
+            grouped_by_comm_err: Dict[str, List[tuple[str, List[str]]]] = {}
+            for kp in key_points:
+                cid = (
+                    str(kp.community_id).strip()
+                    if kp.community_id is not None
+                    else ""
+                )
+                if not cid or cid == "None":
+                    cid = "Unknown"
+                grouped_by_comm_err.setdefault(cid, []).append(
+                    (
+                        f"{kp.point}: {kp.description}".strip(": "),
+                        kp.entities or [],
+                    )
+                )
+            lines = [
                 f"Global synthesis for '{query}' based on community findings:\n"
-                + context_text
-            )
+            ]
+            for comm_id, pts_with_ents in grouped_by_comm_err.items():
+                all_ents_err: List[str] = []
+                for _, ents in pts_with_ents:
+                    for e in ents:
+                        if e and e not in all_ents_err:
+                            all_ents_err.append(e)
+                ents_hdr = (
+                    f" (Entities: {', '.join(all_ents_err)})" if all_ents_err else ""
+                )
+                lines.append(f"From [Community {comm_id}]{ents_hdr}:")
+                for pt, ents in pts_with_ents:
+                    ents_str = (
+                        f" (Entities: {', '.join(ents)})" if ents else ""
+                    )
+                    lines.append(f"  • {pt}{ents_str}")
+            fallback_text = "\n".join(lines)
+            return self._ensure_evidence_citations(fallback_text, key_points)
 
     def search(
         self,

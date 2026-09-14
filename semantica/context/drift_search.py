@@ -9,6 +9,7 @@ executive synthesis.
 
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+import hashlib
 import json
 import math
 import re
@@ -234,19 +235,21 @@ class DriftSearchResult:
         for fact in self.verified_local_contexts:
             src = str(fact.get("source", ""))
             tgt = str(fact.get("target", ""))
+            src_name = str(fact.get("source_name") or src)
+            tgt_name = str(fact.get("target_name") or tgt)
             rel = str(fact.get("relation", "RELATED_TO"))
             desc = str(fact.get("description", ""))
 
-            content_text = f"({src}) -[{rel}]-> ({tgt})"
+            content_text = f"({src_name}) -[{rel}]-> ({tgt_name})"
             if desc:
                 content_text += f": {desc}"
 
             score_val = float(fact.get("alignment_score", fact.get("score", 0.8)))
             scaled_score = max(0.0, min(1.0, score_val))
 
-            entities = [{"id": src, "name": src}]
+            entities = [{"id": src, "name": src_name}]
             if tgt and tgt != src:
-                entities.append({"id": tgt, "name": tgt})
+                entities.append({"id": tgt, "name": tgt_name})
 
             rel_data = {
                 "source": src,
@@ -263,7 +266,11 @@ class DriftSearchResult:
                     metadata={
                         "source": src,
                         "target": tgt,
+                        "source_name": src_name,
+                        "target_name": tgt_name,
                         "relation": rel,
+                        "canonical_id": fact.get("canonical_id", ""),
+                        "edge_id": fact.get("edge_id", ""),
                         "depth": fact.get("depth", 0),
                         "alignment_score": score_val,
                         **dict(fact.get("attributes", {})),
@@ -335,6 +342,52 @@ def _extract_words(text: str) -> Set[str]:
     return set(re.findall(r"\b\w+\b", text.lower()))
 
 
+def _truncate_to_tokens(
+    text: str,
+    max_tokens: int,
+    token_counter: Optional[Callable[[str], int]] = None,
+) -> str:
+    """Truncate text to fit within max_tokens without breaking prematurely."""
+    if not text or max_tokens <= 0:
+        return ""
+    if estimate_tokens(text, token_counter) <= max_tokens:
+        return text
+    low = 0
+    high = len(text)
+    best = 0
+    while low <= high:
+        mid = (low + high) // 2
+        cand = text[:mid]
+        if estimate_tokens(cand, token_counter) <= max_tokens:
+            best = mid
+            low = mid + 1
+        else:
+            high = mid - 1
+    return text[:best].rstrip()
+
+
+def _first_non_none(
+    d: Dict[str, Any], keys: Sequence[str], default: Any = None
+) -> Any:
+    """Return first value in d matching any key whose value is not None."""
+    for k in keys:
+        if k in d and d[k] is not None:
+            return d[k]
+    return default
+
+
+def _first_attr_non_none(
+    obj: Any, attrs: Sequence[str], default: Any = None
+) -> Any:
+    """Return first attribute on obj matching any attr name whose value is not None."""
+    for a in attrs:
+        if hasattr(obj, a):
+            val = getattr(obj, a)
+            if val is not None:
+                return val
+    return default
+
+
 class DriftSearchEngine:
     """
     DRIFT Hybrid Search Engine for Hierarchical GraphRAG.
@@ -374,16 +427,32 @@ class DriftSearchEngine:
         self.top_k_reports = max(1, int(top_k_reports))
         self.max_facets = max(1, int(max_facets))
         self.max_context_tokens = max(1, int(max_context_tokens))
+        self.response_token_budget = max(
+            1, int(kwargs.get("response_token_budget", 500))
+        )
         self.config = kwargs
-
         self._reports: List[CommunityReport] = []
-        if reports is not None:
-            self.set_reports(reports)
-
+        self._report_index: Dict[str, CommunityReport] = {}
         self._adjacency_index: Dict[str, List[Dict[str, Any]]] = {}
         self._node_meta: Dict[str, Dict[str, Any]] = {}
+        self._alias_to_id: Dict[str, str] = {}
+
+        if reports:
+            self.set_reports(reports)
         if knowledge_graph is not None:
             self.set_knowledge_graph(knowledge_graph)
+
+    def _resolve_node_id(self, entity_str: Any) -> str:
+        """Resolve an entity name, alias, or ID to its canonical node ID."""
+        if entity_str is None or str(entity_str).strip() == "":
+            return ""
+        s = str(entity_str).strip()
+        if s in self._adjacency_index:
+            return s
+        lower = s.lower()
+        if lower in self._alias_to_id:
+            return self._alias_to_id[lower]
+        return s
 
     def set_reports(
         self,
@@ -462,84 +531,84 @@ class DriftSearchEngine:
                 raw_nodes = getattr(graph, "entities", None)
 
         def _extract_node_entry(
-            val: Any, fallback_id: str = ""
+            val: Any, fallback_id: Any = None
         ) -> tuple[str, Dict[str, Any]]:
             if isinstance(val, dict):
-                nid = str(
-                    val.get("id")
-                    or val.get("name")
-                    or val.get("entity_id")
-                    or val.get("node_id")
-                    or fallback_id
+                raw_nid = _first_non_none(
+                    val,
+                    ("id", "name", "entity_id", "node_id"),
+                    fallback_id,
                 )
+                nid = str(raw_nid).strip() if raw_nid is not None else ""
                 d = dict(val)
                 props = (
                     d.get("properties")
                     if isinstance(d.get("properties"), dict)
                     else (d.get("n") if isinstance(d.get("n"), dict) else {})
                 )
-                name_val = (
-                    d.get("name")
-                    or d.get("label")
-                    or props.get("name")
-                    or props.get("label")
-                    or nid
-                )
-                d.setdefault("name", str(name_val))
+                raw_name = _first_non_none(d, ("name", "label"), None)
+                if raw_name is None and isinstance(props, dict):
+                    raw_name = _first_non_none(props, ("name", "label"), None)
+                if raw_name is None:
+                    raw_name = nid
+                d.setdefault("name", str(raw_name))
+                d.setdefault("id", nid)
                 return nid, d
             if hasattr(val, "to_dict") and callable(val.to_dict):
                 d = dict(val.to_dict())
-                nid = str(
-                    d.get("id") or d.get("node_id") or d.get("name") or fallback_id
+                raw_nid = _first_non_none(
+                    d, ("id", "node_id", "name"), fallback_id
                 )
+                nid = str(raw_nid).strip() if raw_nid is not None else ""
                 props = (
                     d.get("properties")
                     if isinstance(d.get("properties"), dict)
                     else {}
                 )
-                name_val = (
-                    d.get("name")
-                    or d.get("label")
-                    or props.get("name")
-                    or props.get("label")
-                    or nid
-                )
-                d.setdefault("name", str(name_val))
+                raw_name = _first_non_none(d, ("name", "label"), None)
+                if raw_name is None and isinstance(props, dict):
+                    raw_name = _first_non_none(props, ("name", "label"), None)
+                if raw_name is None:
+                    raw_name = nid
+                d.setdefault("name", str(raw_name))
+                d.setdefault("id", nid)
                 return nid, d
             if hasattr(val, "node_id"):
-                nid = str(getattr(val, "node_id", fallback_id))
+                raw_nid = getattr(val, "node_id", None)
+                if raw_nid is None:
+                    raw_nid = fallback_id
+                nid = str(raw_nid).strip() if raw_nid is not None else ""
                 props = dict(getattr(val, "properties", {}) or {})
                 meta = dict(getattr(val, "metadata", {}) or {})
+                raw_name = _first_non_none(
+                    props,
+                    ("name", "label"),
+                    _first_non_none(meta, ("label",), nid),
+                )
                 d = {
                     "id": nid,
+                    "name": str(raw_name),
                     "type": str(getattr(val, "node_type", "")),
                     "content": str(getattr(val, "content", "")),
                     **props,
                     **meta,
                 }
-                d.setdefault(
-                    "name",
-                    str(
-                        props.get("name")
-                        or props.get("label")
-                        or meta.get("label")
-                        or nid
-                    ),
-                )
                 return nid, d
-            nid = fallback_id if fallback_id else str(val)
+            raw_nid = fallback_id if fallback_id is not None else val
+            nid = str(raw_nid).strip() if raw_nid is not None else ""
             return nid, {"id": nid, "name": nid}
 
         if isinstance(raw_nodes, dict):
             for k, v in raw_nodes.items():
-                nid, d = _extract_node_entry(v, str(k))
-                nodes_info[nid] = d
+                nid, d = _extract_node_entry(v, k)
+                if nid != "":
+                    nodes_info[nid] = d
         elif isinstance(raw_nodes, Iterable) and not isinstance(
             raw_nodes, (str, bytes)
         ):
             for item in raw_nodes:
                 if isinstance(item, tuple) and len(item) == 2:
-                    nid = str(item[0])
+                    nid = str(item[0]).strip() if item[0] is not None else ""
                     if isinstance(item[1], dict):
                         d = dict(item[1])
                         d.setdefault("id", nid)
@@ -548,21 +617,43 @@ class DriftSearchEngine:
                             if isinstance(d.get("properties"), dict)
                             else {}
                         )
-                        name_val = (
-                            d.get("name")
-                            or d.get("label")
-                            or props.get("name")
-                            or props.get("label")
-                            or nid
+                        raw_name = _first_non_none(
+                            d,
+                            ("name", "label"),
+                            _first_non_none(props, ("name", "label"), nid),
                         )
-                        d.setdefault("name", str(name_val))
-                        nodes_info[nid] = d
+                        d.setdefault("name", str(raw_name))
+                        if nid != "":
+                            nodes_info[nid] = d
                     else:
-                        nodes_info[nid] = {"id": nid, "name": nid}
+                        if nid != "":
+                            nodes_info[nid] = {"id": nid, "name": nid}
                 else:
                     nid, d = _extract_node_entry(item)
-                    if nid:
+                    if nid != "":
                         nodes_info[nid] = d
+
+        alias_map: Dict[str, str] = {}
+        for nid, info in nodes_info.items():
+            if nid != "":
+                alias_map[nid.lower()] = nid
+                name_val = info.get("name")
+                if name_val is not None and str(name_val).strip():
+                    alias_map[str(name_val).strip().lower()] = nid
+                label_val = info.get("label")
+                if label_val is not None and str(label_val).strip():
+                    alias_map[str(label_val).strip().lower()] = nid
+                aliases = info.get("aliases")
+                if isinstance(aliases, (list, tuple, set)):
+                    for a in aliases:
+                        if a is not None and str(a).strip():
+                            alias_map[str(a).strip().lower()] = nid
+                props = info.get("properties")
+                if isinstance(props, dict):
+                    for prop_k in ("name", "label", "title"):
+                        pv = props.get(prop_k)
+                        if pv is not None and str(pv).strip():
+                            alias_map[str(pv).strip().lower()] = nid
 
         # 2. Extract edges
         raw_edges = None
@@ -617,11 +708,21 @@ class DriftSearchEngine:
                 raw_edges.values() if isinstance(raw_edges, dict) else raw_edges
             )
             for item in edge_iterable:
-                src, tgt, rel, attrs, desc = self._parse_edge_item(item)
-                if not src or not tgt:
+                src, tgt, rel, attrs, desc, edge_id = self._parse_edge_item(item)
+                if src == "" or tgt == "":
                     continue
 
-                canonical_id = f"{src}->{rel}->{tgt}"
+                if edge_id:
+                    canonical_id = f"{src}->{rel}->{tgt}:{edge_id}"
+                else:
+                    payload = json.dumps(
+                        {"rel": rel, "desc": desc, "attrs": attrs},
+                        sort_keys=True,
+                        default=str,
+                    )
+                    h = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+                    canonical_id = f"{src}->{rel}->{tgt}:{h}"
+
                 edge_dict = {
                     "source": src,
                     "target": tgt,
@@ -630,38 +731,49 @@ class DriftSearchEngine:
                     "attributes": attrs,
                     "canonical_id": canonical_id,
                 }
+                if edge_id:
+                    edge_dict["edge_id"] = edge_id
                 adj.setdefault(src, []).append(edge_dict)
                 # For undirected retrieval traversal, allow bidirection lookup
                 if src != tgt:
-                    adj.setdefault(tgt, []).append(
-                        {
-                            "source": tgt,
-                            "target": src,
-                            "relation": rel,
-                            "description": desc,
-                            "attributes": attrs,
-                            "canonical_id": canonical_id,
-                            "is_inverse": True,
-                        }
-                    )
+                    inv_dict = {
+                        "source": tgt,
+                        "target": src,
+                        "relation": rel,
+                        "description": desc,
+                        "attributes": attrs,
+                        "canonical_id": canonical_id,
+                        "is_inverse": True,
+                    }
+                    if edge_id:
+                        inv_dict["edge_id"] = edge_id
+                    adj.setdefault(tgt, []).append(inv_dict)
+
+                for ep in (src, tgt):
+                    if ep not in nodes_info:
+                        nodes_info[ep] = {"id": ep, "name": ep}
+                    if ep.lower() not in alias_map:
+                        alias_map[ep.lower()] = ep
 
         self._adjacency_index = adj
         self._node_meta = nodes_info
+        self._alias_to_id = alias_map
 
     def _parse_edge_item(
         self, item: Any
-    ) -> tuple[str, str, str, Dict[str, Any], str]:
-        """Normalize raw edge representation into src, tgt, rel, attrs, desc."""
-        src = ""
-        tgt = ""
+    ) -> tuple[str, str, str, Dict[str, Any], str, str]:
+        """Normalize raw edge into src, tgt, rel, attrs, desc, edge_id."""
+        src_val = None
+        tgt_val = None
         rel = "RELATED_TO"
         attrs: Dict[str, Any] = {}
         desc = ""
+        edge_id = ""
 
         if isinstance(item, (tuple, list)):
             if len(item) >= 2:
-                src = str(item[0])
-                tgt = str(item[1])
+                src_val = item[0]
+                tgt_val = item[1]
             if len(item) >= 3:
                 third = item[2]
                 if isinstance(third, str):
@@ -678,6 +790,13 @@ class DriftSearchEngine:
                         or rel
                     )
                     desc = str(attrs.get("description") or attrs.get("desc") or "")
+                    edge_id = str(
+                        attrs.get("id")
+                        or attrs.get("edge_id")
+                        or attrs.get("rel_id")
+                        or attrs.get("relationship_id")
+                        or ""
+                    )
             if len(item) >= 4 and isinstance(item[3], dict):
                 fourth = dict(item[3])
                 attrs.update(fourth)
@@ -692,28 +811,42 @@ class DriftSearchEngine:
                 )
                 if not desc:
                     desc = str(attrs.get("description") or attrs.get("desc") or "")
+                if not edge_id:
+                    edge_id = str(
+                        attrs.get("id")
+                        or attrs.get("edge_id")
+                        or attrs.get("rel_id")
+                        or attrs.get("relationship_id")
+                        or ""
+                    )
         elif isinstance(item, dict):
-            src = str(
-                item.get("source")
-                or item.get("source_id")
-                or item.get("start_node_id")
-                or item.get("start_id")
-                or item.get("start")
-                or item.get("from")
-                or item.get("subject")
-                or item.get("src")
-                or ""
+            src_val = _first_non_none(
+                item,
+                (
+                    "source",
+                    "source_id",
+                    "start_node_id",
+                    "start_id",
+                    "start",
+                    "from",
+                    "subject",
+                    "src",
+                ),
+                None,
             )
-            tgt = str(
-                item.get("target")
-                or item.get("target_id")
-                or item.get("end_node_id")
-                or item.get("end_id")
-                or item.get("end")
-                or item.get("to")
-                or item.get("object")
-                or item.get("dst")
-                or ""
+            tgt_val = _first_non_none(
+                item,
+                (
+                    "target",
+                    "target_id",
+                    "end_node_id",
+                    "end_id",
+                    "end",
+                    "to",
+                    "object",
+                    "dst",
+                ),
+                None,
             )
             rel = str(
                 item.get("relation")
@@ -735,6 +868,16 @@ class DriftSearchEngine:
                 or props.get("desc")
                 or ""
             )
+            raw_edge_id = _first_non_none(
+                item,
+                ("id", "edge_id", "rel_id", "relationship_id"),
+                _first_non_none(
+                    props,
+                    ("id", "edge_id", "rel_id", "relationship_id"),
+                    None,
+                ),
+            )
+            edge_id = str(raw_edge_id).strip() if raw_edge_id is not None else ""
             attrs = dict(item.get("attributes") or {})
             if props and not attrs:
                 attrs.update(props)
@@ -765,31 +908,42 @@ class DriftSearchEngine:
                     "attributes",
                     "properties",
                     "r",
+                    "id",
+                    "edge_id",
+                    "rel_id",
+                    "relationship_id",
                 ):
                     attrs[k] = v
         else:
-            src = str(
-                getattr(item, "source", None)
-                or getattr(item, "source_id", None)
-                or getattr(item, "start_node_id", None)
-                or getattr(item, "start_id", None)
-                or getattr(item, "start", None)
-                or getattr(item, "from_node", None)
-                or getattr(item, "subject", "")
-                or getattr(item, "src", "")
-                or ""
+            src_val = _first_attr_non_none(
+                item,
+                (
+                    "source",
+                    "source_id",
+                    "start_node_id",
+                    "start_id",
+                    "start",
+                    "from_node",
+                    "from",
+                    "subject",
+                    "src",
+                ),
+                None,
             )
-            tgt = str(
-                getattr(item, "target", None)
-                or getattr(item, "target_id", None)
-                or getattr(item, "end_node_id", None)
-                or getattr(item, "end_id", None)
-                or getattr(item, "end", None)
-                or getattr(item, "to_node", None)
-                or getattr(item, "to", None)
-                or getattr(item, "object", "")
-                or getattr(item, "dst", "")
-                or ""
+            tgt_val = _first_attr_non_none(
+                item,
+                (
+                    "target",
+                    "target_id",
+                    "end_node_id",
+                    "end_id",
+                    "end",
+                    "to_node",
+                    "to",
+                    "object",
+                    "dst",
+                ),
+                None,
             )
             rel = str(
                 getattr(item, "edge_type", None)
@@ -807,6 +961,16 @@ class DriftSearchEngine:
                 or {}
             )
             attrs = dict(attrs_obj) if isinstance(attrs_obj, dict) else {}
+            raw_edge_id = _first_attr_non_none(
+                item,
+                ("id", "edge_id", "rel_id", "relationship_id"),
+                _first_non_none(
+                    attrs,
+                    ("id", "edge_id", "rel_id", "relationship_id"),
+                    None,
+                ),
+            )
+            edge_id = str(raw_edge_id).strip() if raw_edge_id is not None else ""
             desc = str(
                 getattr(item, "description", "")
                 or getattr(item, "desc", "")
@@ -815,7 +979,9 @@ class DriftSearchEngine:
                 or ""
             )
 
-        return (src.strip(), tgt.strip(), rel.strip(), attrs, desc.strip())
+        src = str(src_val).strip() if src_val is not None else ""
+        tgt = str(tgt_val).strip() if tgt_val is not None else ""
+        return (src, tgt, rel.strip(), attrs, desc.strip(), edge_id.strip())
 
     def _extract_thematic_framing(
         self, query: str, query_embedding: Optional[List[float]] = None
@@ -949,11 +1115,54 @@ class DriftSearchEngine:
         if llm is None:
             return self._extractive_facets_fallback(query)
 
+        prompt_scaffold = (
+            "You are a directed reasoning engine in a GraphRAG system.\n"
+            "User Query: \n\n"
+            "Global Thematic Framing:\n\n\n"
+            "Instructions:\n"
+            f"1. Generate up to {self.max_facets} targeted follow-up sub-queries "
+            "to drill down into local knowledge graph relationships.\n"
+            "2. For each sub-query, identify 1-3 seed target entities to inspect.\n"
+            "3. Return the response in JSON with 'facets': list of "
+            "{'sub_query', 'target_entities', 'rationale', 'relevance_score'}."
+        )
+        base_tokens = estimate_tokens(prompt_scaffold, self.token_counter)
+        response_reserve = min(
+            getattr(self, "response_token_budget", 500),
+            max(10, self.max_context_tokens // 5),
+        )
+        available_content = max(
+            0, self.max_context_tokens - base_tokens - response_reserve
+        )
+        query_budget = max(1, available_content // 2) if available_content > 0 else 0
+        budgeted_query = (
+            _truncate_to_tokens(query, query_budget, self.token_counter)
+            if query_budget > 0
+            else ""
+        )
+        query_tokens = (
+            estimate_tokens(f"User Query: {budgeted_query}\n\n", self.token_counter)
+            - estimate_tokens("User Query: \n\n", self.token_counter)
+            if budgeted_query
+            else 0
+        )
+        remaining_for_framing = max(
+            0,
+            self.max_context_tokens - base_tokens - query_tokens - response_reserve,
+        )
+        budgeted_framing = (
+            _truncate_to_tokens(
+                thematic_framing, remaining_for_framing, self.token_counter
+            )
+            if remaining_for_framing > 0
+            else ""
+        )
+
         prompt = (
             "You are a directed reasoning engine in a GraphRAG system.\n"
-            f"User Query: {query}\n\n"
-            f"Global Thematic Framing:\n{thematic_framing}\n\n"
-            f"Instructions:\n"
+            f"User Query: {budgeted_query}\n\n"
+            f"Global Thematic Framing:\n{budgeted_framing}\n\n"
+            "Instructions:\n"
             f"1. Generate up to {self.max_facets} targeted follow-up sub-queries "
             "to drill down into local knowledge graph relationships.\n"
             "2. For each sub-query, identify 1-3 seed target entities to inspect.\n"
@@ -1043,13 +1252,38 @@ class DriftSearchEngine:
                     if ent not in candidate_entities:
                         candidate_entities.append(ent)
 
+        for nid, meta in self._node_meta.items():
+            name = str(meta.get("name") or "")
+            label = str(meta.get("label") or "")
+            aliases = (
+                meta.get("aliases")
+                if isinstance(meta.get("aliases"), list)
+                else []
+            )
+            names_to_check = [nid, name, label] + list(aliases)
+            matched = any(
+                n and (
+                    n.lower() in query.lower()
+                    or bool(_extract_words(n) & query_words)
+                )
+                for n in names_to_check
+            )
+            if matched:
+                cand = name if name else nid
+                if cand not in candidate_entities:
+                    candidate_entities.append(cand)
+
         for nid in self._adjacency_index.keys():
             if nid.lower() in query.lower() or _extract_words(nid) & query_words:
-                if nid not in candidate_entities:
-                    candidate_entities.append(nid)
+                cand = str(self._node_meta.get(nid, {}).get("name") or nid)
+                if cand not in candidate_entities:
+                    candidate_entities.append(cand)
 
         if not candidate_entities and self._adjacency_index:
-            candidate_entities = sorted(self._adjacency_index.keys())[:3]
+            for nid in sorted(self._adjacency_index.keys())[:3]:
+                cand = str(self._node_meta.get(nid, {}).get("name") or nid)
+                if cand not in candidate_entities:
+                    candidate_entities.append(cand)
 
         facets: List[DriftFacet] = []
         for ent in candidate_entities[: self.max_facets]:
@@ -1115,6 +1349,8 @@ class DriftSearchEngine:
         query: str,
         thematic_framing: str,
         query_embedding: Optional[List[float]] = None,
+        max_depth: Optional[int] = None,
+        drift_threshold: Optional[float] = None,
     ) -> tuple[List[Dict[str, Any]], int, int]:
         """
         Stages 3, 4, and 5: Local entity-hop traversal, drift pruning, and deepening.
@@ -1127,16 +1363,51 @@ class DriftSearchEngine:
         accumulated_tokens = 0
         budget_reached = False
 
+        eff_max_depth = (
+            self.max_depth if max_depth is None else max(1, int(max_depth))
+        )
+        eff_drift_thresh = (
+            self.drift_threshold
+            if drift_threshold is None
+            else max(0.0, min(1.0, float(drift_threshold)))
+        )
+
         query_context = f"{query} {thematic_framing}"
 
-        # Collect initial seed entities from facets
+        # Scaffold tokens measurement for budget allocation
+        hybrid_scaffold = (
+            "You are an authoritative intelligence analyst synthesizing a hybrid "
+            f"knowledge answer.\nQuery: {query}\n\n"
+            f"Macro Thematic Context:\n{thematic_framing}\n\n"
+            "Verified Local Graph Relationships:\n\n\n"
+            "Instructions:\n"
+            "1. Synthesize a comprehensive answer directly resolving the query.\n"
+            "2. Dual Attribution: cite macro assertions with [Community <id>] "
+            "and cite micro local relationships as (EntityA -[REL]-> EntityB).\n"
+            "3. Ground all assertions strictly in the provided macro and micro "
+            "evidence.\n"
+            "4. Be concise, coherent, and executive-ready."
+        )
+        scaffold_tokens = estimate_tokens(hybrid_scaffold, self.token_counter)
+        response_reserve = min(500, max(10, self.max_context_tokens // 5))
+        facts_budget = max(
+            min(50, self.max_context_tokens),
+            self.max_context_tokens - scaffold_tokens - response_reserve,
+        )
+
+        # Collect initial seed entities from facets, resolving names through alias map
         current_frontier: Set[str] = set()
         for f in facets:
             for ent in f.target_entities:
-                if ent:
+                if not ent:
+                    continue
+                resolved_id = self._resolve_node_id(ent)
+                if resolved_id and resolved_id in self._adjacency_index:
+                    current_frontier.add(resolved_id)
+                elif ent in self._adjacency_index:
                     current_frontier.add(ent)
 
-        for depth in range(self.max_depth):
+        for depth in range(eff_max_depth):
             if not current_frontier or budget_reached:
                 break
             depth_reached = depth + 1
@@ -1160,14 +1431,21 @@ class DriftSearchEngine:
                         continue
                     seen_edges.add(canon_id)
 
+                    src_name = str(
+                        self._node_meta.get(src, {}).get("name") or src
+                    )
+                    tgt_name = str(
+                        self._node_meta.get(tgt, {}).get("name") or tgt
+                    )
+
                     if edge.get("is_inverse"):
                         fact_text = (
-                            f"({tgt}) -[{edge['relation']}]-> ({src}): "
+                            f"({tgt_name}) -[{edge['relation']}]-> ({src_name}): "
                             f"{edge.get('description', '')}"
                         )
                     else:
                         fact_text = (
-                            f"({src}) -[{edge['relation']}]-> ({tgt}): "
+                            f"({src_name}) -[{edge['relation']}]-> ({tgt_name}): "
                             f"{edge.get('description', '')}"
                         )
 
@@ -1175,15 +1453,17 @@ class DriftSearchEngine:
                         fact_text, query_context, query_embedding
                     )
 
-                    if score >= self.drift_threshold:
+                    if score >= eff_drift_thresh:
                         fact_cost = estimate_tokens(fact_text, self.token_counter)
-                        if accumulated_tokens + fact_cost > self.max_context_tokens:
+                        if accumulated_tokens + fact_cost > facts_budget:
                             budget_reached = True
                             break
                         if edge.get("is_inverse"):
                             verified_edge = {
                                 "source": tgt,
                                 "target": src,
+                                "source_name": tgt_name,
+                                "target_name": src_name,
                                 "relation": edge["relation"],
                                 "description": edge.get("description", ""),
                                 "attributes": dict(edge.get("attributes", {})),
@@ -1192,15 +1472,20 @@ class DriftSearchEngine:
                             verified_edge = {
                                 "source": src,
                                 "target": tgt,
+                                "source_name": src_name,
+                                "target_name": tgt_name,
                                 "relation": edge["relation"],
                                 "description": edge.get("description", ""),
                                 "attributes": dict(edge.get("attributes", {})),
                             }
+                        verified_edge["canonical_id"] = canon_id
+                        if edge.get("edge_id"):
+                            verified_edge["edge_id"] = edge["edge_id"]
                         verified_edge["alignment_score"] = score
                         verified_edge["depth"] = depth_reached
                         verified_facts.append(verified_edge)
                         accumulated_tokens += fact_cost
-                        if tgt and tgt not in visited_entities:
+                        if tgt != "" and tgt not in visited_entities:
                             next_frontier.add(tgt)
                     else:
                         pruned_count += 1
@@ -1231,24 +1516,87 @@ class DriftSearchEngine:
                 str(f.get("target", "")),
             ),
         )
+
+        # Token budgeting to guarantee prompt does not exceed max_context_tokens
+        prompt_scaffold = (
+            "You are an authoritative intelligence analyst synthesizing a hybrid "
+            "knowledge answer.\nQuery: \n\n"
+            "Macro Thematic Context:\n\n\n"
+            "Verified Local Graph Relationships:\nNone\n\n"
+            "Instructions:\n"
+            "1. Synthesize a comprehensive answer directly resolving the query.\n"
+            "2. Dual Attribution: cite macro assertions with [Community <id>] "
+            "and cite micro local relationships as (EntityA -[REL]-> EntityB).\n"
+            "3. Ground all assertions strictly in the provided macro and micro "
+            "evidence.\n"
+            "4. Be concise, coherent, and executive-ready."
+        )
+        base_tokens = estimate_tokens(prompt_scaffold, self.token_counter)
+        response_reserve = min(
+            getattr(self, "response_token_budget", 500),
+            max(10, self.max_context_tokens // 5),
+        )
+        available_content = max(
+            0, self.max_context_tokens - base_tokens - response_reserve
+        )
+        query_budget = max(1, available_content // 3) if available_content > 0 else 0
+        budgeted_query = (
+            _truncate_to_tokens(query, query_budget, self.token_counter)
+            if query_budget > 0
+            else ""
+        )
+        query_tokens = (
+            estimate_tokens(f"Query: {budgeted_query}\n\n", self.token_counter)
+            - estimate_tokens("Query: \n\n", self.token_counter)
+            if budgeted_query
+            else 0
+        )
+        available_for_context = max(
+            0, self.max_context_tokens - base_tokens - query_tokens - response_reserve
+        )
+        framing_target = (
+            available_for_context // 2 if available_for_context > 0 else 0
+        )
+        budgeted_framing = (
+            _truncate_to_tokens(
+                thematic_framing, framing_target, self.token_counter
+            )
+            if framing_target > 0
+            else ""
+        )
+        framing_tokens = (
+            estimate_tokens(budgeted_framing, self.token_counter)
+            if budgeted_framing
+            else 0
+        )
+        facts_budget = max(0, available_for_context - framing_tokens)
+
         facts_preview: List[str] = []
-        for fact in sorted_facts[:20]:
-            src = fact["source"]
-            tgt = fact["target"]
+        accumulated_fact_tokens = 0
+        for fact in sorted_facts:
+            src = fact.get("source_name") or fact["source"]
+            tgt = fact.get("target_name") or fact["target"]
             rel = fact["relation"]
             desc = fact.get("description", "")
             line = f"- ({src}) -[{rel}]-> ({tgt})"
             if desc:
                 line += f": {desc}"
-            facts_preview.append(line)
+            line_cost = estimate_tokens(line + "\n", self.token_counter)
+            if accumulated_fact_tokens + line_cost <= facts_budget:
+                facts_preview.append(line)
+                accumulated_fact_tokens += line_cost
+            else:
+                break
+
         facts_text = "\n".join(facts_preview) if facts_preview else "None"
 
         if llm is None:
             # Deterministic synthesis
-            lines = [f"DRIFT Hybrid Response for: '{query}'\n"]
-            if thematic_framing:
+            display_query = budgeted_query if budgeted_query else query
+            lines = [f"DRIFT Hybrid Response for: '{display_query}'\n"]
+            if budgeted_framing:
                 lines.append("Macro Context:")
-                lines.append(thematic_framing)
+                lines.append(budgeted_framing)
                 lines.append("")
             if facts_preview:
                 lines.append("Verified Local Graph Facts:")
@@ -1257,8 +1605,8 @@ class DriftSearchEngine:
 
         prompt = (
             "You are an authoritative intelligence analyst synthesizing a hybrid "
-            f"knowledge answer.\nQuery: {query}\n\n"
-            f"Macro Thematic Context:\n{thematic_framing}\n\n"
+            f"knowledge answer.\nQuery: {budgeted_query}\n\n"
+            f"Macro Thematic Context:\n{budgeted_framing}\n\n"
             f"Verified Local Graph Relationships:\n{facts_text}\n\n"
             "Instructions:\n"
             "1. Synthesize a comprehensive answer directly resolving the query.\n"
@@ -1287,7 +1635,7 @@ class DriftSearchEngine:
         except Exception as e:
             self.logger.warning(f"DRIFT synthesis LLM failed: {e}")
             return (
-                f"DRIFT answer for '{query}':\n\n{thematic_framing}\n\n"
+                f"DRIFT answer for '{query}':\n\n{budgeted_framing}\n\n"
                 f"Verified Facts:\n{facts_text}"
             )
 
@@ -1337,22 +1685,18 @@ class DriftSearchEngine:
         facets = self._generate_facets(query, thematic_framing)
 
         # Stages 3, 4, 5: Local traversal, drift pruning, deepening
-        orig_max_depth = self.max_depth
-        orig_thresh = self.drift_threshold
-        self.max_depth = eff_max_depth
-        self.drift_threshold = eff_drift_thresh
-
-        try:
-            (
-                verified_facts,
-                depth_reached,
-                pruned_count,
-            ) = self._traverse_and_prune(
-                facets, query, thematic_framing, query_embedding
-            )
-        finally:
-            self.max_depth = orig_max_depth
-            self.drift_threshold = orig_thresh
+        (
+            verified_facts,
+            depth_reached,
+            pruned_count,
+        ) = self._traverse_and_prune(
+            facets,
+            query,
+            thematic_framing,
+            query_embedding,
+            max_depth=eff_max_depth,
+            drift_threshold=eff_drift_thresh,
+        )
 
         # Sort verified_facts descending by alignment_score
         verified_facts.sort(
@@ -1382,18 +1726,18 @@ class DriftSearchEngine:
             if str(c) in valid_comm_ids
         ]
 
-        valid_triples_map = {
-            (
-                str(f.get("source", "")).strip().lower(),
-                str(f.get("relation", "")).strip().lower(),
-                str(f.get("target", "")).strip().lower(),
-            ): (
-                str(f.get("source", "")).strip(),
-                str(f.get("relation", "")).strip(),
-                str(f.get("target", "")).strip(),
-            )
-            for f in verified_facts
-        }
+        valid_triples_map = {}
+        for f in verified_facts:
+            s_id = str(f.get("source", "")).strip()
+            t_id = str(f.get("target", "")).strip()
+            s_name = str(f.get("source_name") or s_id).strip()
+            t_name = str(f.get("target_name") or t_id).strip()
+            rel = str(f.get("relation", "")).strip()
+            disp = (s_name, rel, t_name)
+            valid_triples_map[(s_id.lower(), rel.lower(), t_id.lower())] = disp
+            valid_triples_map[(s_name.lower(), rel.lower(), t_name.lower())] = disp
+            valid_triples_map[(s_name.lower(), rel.lower(), t_id.lower())] = disp
+            valid_triples_map[(s_id.lower(), rel.lower(), t_name.lower())] = disp
 
         rel_cits: List[str] = []
         seen_rel_cits: Set[str] = set()
